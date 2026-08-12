@@ -326,7 +326,3 @@ results/<fairness-definition>/<granularity>_<stakeholder>/group_<NN>.tsv
 Each row identifies the method, dataset, seed, run, recommendation-list size, baseline and fair-method NDCG, stakeholder, granularity, and baseline/fairness metric values.
 
 The runner preserves existing rows and appends the new rows when a target TSV already exists. Use a new `--results-root`, or archive/remove prior result files, when a clean experiment output is required.
-
-## Method interfaces
-
-The standardized RR, PAM, and OBM entry points—including expected inputs, data files, and outputs—are documented in [METHOD_CONTRACTS.md](METHOD_CONTRACTS.md).
