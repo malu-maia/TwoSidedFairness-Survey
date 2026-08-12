@@ -1,0 +1,45 @@
+# Local Python environment
+/.venv/
+
+# Python-generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Generated experiment inputs
+/experiments/runs/
+
+# Generated experiment outputs
+/results/
+
+# Raw datasets: store/download separately
+/data/raw_datasets/
+
+# Derived run-zero copies
+/data/evaluation/
+/data/mappings/*
+!/data/mappings/README.md
+
+# Logs and temporary files
+/log/
+*.log
+*.tmp
+*.bak
+*~
+
+# Notebook-generated files
+.ipynb_checkpoints/
+
+# IDE and OS metadata
+.idea/
+.vscode/
+.DS_Store
+
+# Secrets
+.env
+.env.*
+!.env.example
