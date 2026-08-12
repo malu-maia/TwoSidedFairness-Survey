@@ -122,94 +122,18 @@ class MethodOutput:
 
 
 GROUPS: tuple[GroupSpec, ...] = (
-    # GroupSpec(1, "equal_satisfaction", "user", "individual", ("TFROM", "LeadFairRec",), "variance_ndcg"),
-    # GroupSpec(2, "equal_satisfaction", "user", "group", ("CPFair",), "variance_group_ndcg"),
-    # GroupSpec(4, "rawlsian", "user", "individual", ("Ada2Fair",), "worse_off_cumulative_utility"),
-    # GroupSpec(7, "ued", "provider", "individual", ("TFROM",), "variance_provider_exposure"),
-    # GroupSpec(8, "ued", "item", "group", ("CPFair",), "variance_item_group_exposure"),
-    # GroupSpec(9, "qwe", "provider", "individual", ("TFROM",), "provider_exposure_relevance_ratio_variance"),
-    # GroupSpec(11, "rawlsian", "provider", "individual", ("Ada2Fair",), "worse_off_cumulative_provider_exposure"),
-    #####################
-#    GroupSpec(
-#        1,
-#        "equal_satisfaction",
-#        "user",
-#        "individual",
-#        (
-#            "TFROM",
-#            "LeadFairRec",
-#            "FairSort",
-#        ),
-#        "variance_ndcg",
-#    ),
-    GroupSpec(
-        2, "equal_satisfaction", "user", "group", ("CPFair",), "variance_group_ndcg"
-    ),
-#    GroupSpec(3, "envy_freeness", "user", "individual", ("FairRec",), "envy_freeness"),
-#    GroupSpec(
-#        4,
-#        "rawlsian",
-#        "user",
-#        "individual",
-#        (
-#            "Ada2Fair",
-#            "TFLD",
-#            "GGF",
-#        ),
-#        "worse_off_cumulative_utility",
-#    ),
-#    GroupSpec(5, "utilitarian", "user", "individual", ("SEAL",), "sum_user_utilities"),
-#    GroupSpec(6, "utilitarian", "user", "group", ("TSFD",), "sum_group_user_utilities"),
-#    GroupSpec(
-#        7,
-#        "ued",
-#        "provider",
-#        "individual",
-#        (
-#            "TFROM",
-#            "FairSort",
-#        ),
-#        "variance_provider_exposure",
-#    ),
+    GroupSpec(1, "equal_satisfaction", "user", "individual", ( "TFROM", "LeadFairRec", "FairSort",), "variance_ndcg",),
+    GroupSpec(2, "equal_satisfaction", "user", "group", ("CPFair",), "variance_group_ndcg",),
+    GroupSpec(3, "envy_freeness", "user", "individual", ("FairRec",), "envy_freeness"),
+    GroupSpec(4, "rawlsian", "user", "individual", ("Ada2Fair", "TFLD", "GGF",), "worse_off_cumulative_utility",),
+    GroupSpec(5, "utilitarian", "user", "individual", ("SEAL",), "sum_user_utilities"),
+    GroupSpec(6, "utilitarian", "user", "group", ("TSFD",), "sum_group_user_utilities"),
+    GroupSpec(7, "ued", "provider", "individual", ("TFROM", "FairSort",), "variance_provider_exposure",),
     GroupSpec(8, "ued", "item", "group", ("CPFair",), "variance_item_group_exposure"),
- #   GroupSpec(
- #       9,
- #       "qwe",
- #       "provider",
- #       "individual",
- #       (
- #           "TFROM",
- #           "FairSort",
- #       ),
- #       "provider_exposure_relevance_ratio_variance",
- #   ),
- #   GroupSpec(
- #       10,
- #       "qwe",
- #       "item",
- #       "group",
- #       ("TSFD",),
- #       "item_group_exposure_relevance_ratio_variance",
- #   ),
- #   GroupSpec(
- #       11,
- #       "rawlsian",
- #       "provider",
- #       "individual",
- #       ("Ada2Fair",),
- #       "worse_off_cumulative_provider_exposure",
- #   ),
- #   GroupSpec(
- #       12,
- #       "rawlsian",
- #       "item",
- #       "individual",
- #       (
- #           "GGF",
- #           "TFLD",
- #       ),
- #       "worse_off_cumulative_item_exposure",
- #   ),
+    GroupSpec(9, "qwe", "provider", "individual", ("TFROM", "FairSort",), "provider_exposure_relevance_ratio_variance",),
+    GroupSpec(10, "qwe", "item", "group", ("TSFD",), "item_group_exposure_relevance_ratio_variance",),
+    GroupSpec(11, "rawlsian", "provider", "individual", ("Ada2Fair",), "worse_off_cumulative_provider_exposure",),
+    GroupSpec(12, "rawlsian", "item", "individual", ("GGF", "TFLD",), "worse_off_cumulative_item_exposure",),
 )
 
 MethodAdapter = Callable[[PreparedRun, RunnerConfig], MethodOutput]
