@@ -8,7 +8,7 @@ import json
 import math
 import os
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
 
@@ -35,6 +35,10 @@ AMBAR_RAW_DIRECTORY = (
 PROTECTED_GROUP = 1
 ADVANTAGED_GROUP = -1
 FEMALE_LABELS = frozenset({"f", "female"})
+YELP_ITEM_GROUP_FILES = {
+    "cpfair-territorial": "yelp_item_poverty.csv",
+    "tfld-metro": "yelp_item_metro.csv",
+}
 
 RESULT_FIELDS = [
     "method",
@@ -73,6 +77,7 @@ class RunnerConfig:
     worse_off_fraction: float = 0.25
     multifr_positive_threshold: float = 0.8
     device: str = "cpu"
+    yelp_tfld_partition: str = "tfld-metro"
 
 
 @dataclass(frozen=True)
@@ -122,18 +127,18 @@ class MethodOutput:
 
 
 GROUPS: tuple[GroupSpec, ...] = (
-    GroupSpec(1, "equal_satisfaction", "user", "individual", ( "TFROM", "LeadFairRec", "FairSort",), "variance_ndcg",),
+    #GroupSpec(1, "equal_satisfaction", "user", "individual", ( "TFROM", "LeadFairRec", "FairSort",), "variance_ndcg",),
     GroupSpec(2, "equal_satisfaction", "user", "group", ("CPFair",), "variance_group_ndcg",),
-    GroupSpec(3, "envy_freeness", "user", "individual", ("FairRec",), "envy_freeness"),
-    GroupSpec(4, "rawlsian", "user", "individual", ("Ada2Fair", "TFLD", "GGF",), "worse_off_cumulative_utility",),
-    GroupSpec(5, "utilitarian", "user", "individual", ("SEAL",), "sum_user_utilities"),
-    GroupSpec(6, "utilitarian", "user", "group", ("TSFD",), "sum_group_user_utilities"),
-    GroupSpec(7, "ued", "provider", "individual", ("TFROM", "FairSort",), "variance_provider_exposure",),
+    #GroupSpec(3, "envy_freeness", "user", "individual", ("FairRec",), "envy_freeness"),
+    #GroupSpec(4, "rawlsian", "user", "individual", ("Ada2Fair", "TFLD", "GGF",), "worse_off_cumulative_utility",),
+    #GroupSpec(5, "utilitarian", "user", "individual", ("SEAL",), "sum_user_utilities"),
+    #GroupSpec(6, "utilitarian", "user", "group", ("TSFD",), "sum_group_user_utilities"),
+    #GroupSpec(7, "ued", "provider", "individual", ("TFROM", "FairSort",), "variance_provider_exposure",),
     GroupSpec(8, "ued", "item", "group", ("CPFair",), "variance_item_group_exposure"),
-    GroupSpec(9, "qwe", "provider", "individual", ("TFROM", "FairSort",), "provider_exposure_relevance_ratio_variance",),
-    GroupSpec(10, "qwe", "item", "group", ("TSFD",), "item_group_exposure_relevance_ratio_variance",),
-    GroupSpec(11, "rawlsian", "provider", "individual", ("Ada2Fair",), "worse_off_cumulative_provider_exposure",),
-    GroupSpec(12, "rawlsian", "item", "individual", ("GGF", "TFLD",), "worse_off_cumulative_item_exposure",),
+    #GroupSpec(9, "qwe", "provider", "individual", ("TFROM", "FairSort",), "provider_exposure_relevance_ratio_variance",),
+    #GroupSpec(10, "qwe", "item", "group", ("TSFD",), "item_group_exposure_relevance_ratio_variance",),
+    #GroupSpec(11, "rawlsian", "provider", "individual", ("Ada2Fair",), "worse_off_cumulative_provider_exposure",),
+    #GroupSpec(12, "rawlsian", "item", "individual", ("GGF", "TFLD",), "worse_off_cumulative_item_exposure",),
 )
 
 MethodAdapter = Callable[[PreparedRun, RunnerConfig], MethodOutput]
@@ -779,7 +784,17 @@ def _ambar_gender_groups(
     return _AMBAR_GROUP_CACHE[run.directory]
 
 
-def _group_vector(run: PreparedRun, method: str, stakeholder: str) -> torch.Tensor:
+def _group_vector(
+    run: PreparedRun,
+    method: str,
+    stakeholder: str,
+    *,
+    config: RunnerConfig | None = None,
+) -> torch.Tensor:
+    if method == "TFLD-Groups" and stakeholder in {"user", "item"}:
+        user_groups, item_groups = _tfld_group_vectors(run, config or RunnerConfig())
+        return user_groups if stakeholder == "user" else item_groups
+
     gender_groups = _ambar_gender_groups(run)
     if gender_groups is not None and stakeholder in {"user", "item"}:
         groups, size = (
@@ -790,6 +805,16 @@ def _group_vector(run: PreparedRun, method: str, stakeholder: str) -> torch.Tens
         return torch.as_tensor(
             [groups[entity_id] for entity_id in range(size)], dtype=torch.long
         )
+    if method == "CPFair" and stakeholder == "user":
+        groups = (
+            _gender_cpfair_groups(run)
+            if run.dataset.lower() == "movielens"
+            else _activity_cpfair_groups(run)
+        )
+        return torch.tensor(
+            [groups[user_id] for user_id in range(run.scores.shape[0])],
+            dtype=torch.long,
+        )
     if stakeholder == "user":
         return _mapping_vector(
             _user_group_path(run, method),
@@ -798,6 +823,9 @@ def _group_vector(run: PreparedRun, method: str, stakeholder: str) -> torch.Tens
             size=run.scores.shape[0],
         )
     if stakeholder == "item":
+        if run.dataset.lower() == "movielens" and method == "CPFair":
+            groups = _movielens_director_item_groups(run)
+            return torch.tensor([groups[item_id] for item_id in range(run.scores.shape[1])], dtype=torch.long)
         return _mapping_vector(
             _item_group_path(run, method),
             id_column="item_id",
@@ -963,18 +991,82 @@ def _run_fairsort(run: PreparedRun, config: RunnerConfig) -> MethodOutput:
     return _as_output(scores, topk, run.k)
 
 
+def _gender_cpfair_groups(run: PreparedRun) -> dict[int, int]:
+    """Map original MovieLens genders to the run's internal user IDs."""
+    path = PROJECT_ROOT / "data" / "mappings" / "movielens_user_gender_mapping.csv"
+    frame = _read_table(path)
+    required = {"user_id", "gender", "user_group"}
+    missing = required.difference(frame.columns)
+    if missing:
+        raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
+    if frame["user_id"].isna().any() or frame["user_id"].astype(str).duplicated().any():
+        raise ValueError(f"{path} must contain unique, nonempty user IDs")
+    expected = frame["gender"].map({"F": PROTECTED_GROUP, "M": ADVANTAGED_GROUP})
+    if expected.isna().any() or not expected.eq(frame["user_group"]).all():
+        raise ValueError(f"{path} must map gender F to +1 and M to -1")
+    lookup = dict(zip(frame["user_id"].astype(str), expected.astype(int)))
+    originals = _mapped_original_ids(run, stakeholder="users", expected_size=run.scores.shape[0])
+    missing_users = [user for user in originals if str(user) not in lookup]
+    if missing_users:
+        raise ValueError(f"{path} does not cover retained users: {missing_users[:5]}")
+    groups = {user_id: lookup[str(original)] for user_id, original in enumerate(originals)}
+    _validate_cpfair_groups(groups, name="MovieLens consumer gender groups")
+    return groups
+
+
+def _movielens_director_item_groups(run: PreparedRun) -> dict[int, int]:
+    if _metadata(run.directory).get("movielens_partition") != "director-gender":
+        raise ValueError(f"{run.directory} is not a MovieLens director-gender run; prepare it with --movielens-director-gender")
+    path = run.directory / "groups" / "cpfair_item_director_gender.csv"
+    frame = _read_table(path)
+    required = {"item_id", "item_group"}
+    if missing := required.difference(frame.columns):
+        raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
+    item_ids = pd.to_numeric(frame["item_id"], errors="coerce")
+    values = pd.to_numeric(frame["item_group"], errors="coerce")
+    if (item_ids.isna().any() or item_ids.duplicated().any()
+            or not item_ids.eq(item_ids.round()).all()
+            or set(item_ids.astype(int)) != set(range(run.scores.shape[1]))):
+        raise ValueError(f"{path} must contain each retained item ID exactly once")
+    if not values.isin([-1, 1]).all():
+        raise ValueError(f"{path} item groups must be -1 or +1")
+    groups = dict(zip(item_ids.astype(int), values.astype(int)))
+    _validate_cpfair_groups(groups, name="MovieLens director gender groups")
+    return groups
+
+
 def _cpfair_style_groups(run: PreparedRun) -> tuple[dict[int, int], dict[int, int]]:
     """Return the user and item groups CPFair scores against.
 
-    AMBAR uses gender; every other dataset uses the top-20% activity split for
-    users and the short-head/long-tail split for items. Shared with
-    ``_run_tfld_groups`` so both group-fairness methods see the same groups.
+    AMBAR and MovieLens use gender for both sides; other datasets use the
+    top-20% activity split for users and short-head/long-tail item groups.
+    TFLD-Groups uses these groups too, except for Yelp metropolitan item groups.
     """
 
     gender_groups = _ambar_gender_groups(run)
     if gender_groups is not None:
         return gender_groups[0], gender_groups[1]
 
+    if run.dataset.lower() == "movielens" and _metadata(run.directory).get("movielens_partition") != "director-gender":
+        raise ValueError(f"{run.directory} is not a MovieLens director-gender run; prepare it with --movielens-director-gender")
+
+    user_groups = (
+        _gender_cpfair_groups(run)
+        if run.dataset.lower() == "movielens"
+        else _activity_cpfair_groups(run)
+    )
+    if run.dataset.lower() == "movielens":
+        item_groups = _movielens_director_item_groups(run)
+    else:
+        item_groups = _mapping_dict_for_cpfair(
+            _item_group_path(run, "CPFair"),
+            id_column="item_id",
+            value_column="item_group",
+        )
+    return user_groups, item_groups
+
+
+def _activity_cpfair_groups(run: PreparedRun) -> dict[int, int]:
     user_activity = torch.count_nonzero(run.train_matrix, dim=1).tolist()
     active_count = max(1, math.ceil(0.2 * len(user_activity)))
     active_users = set(
@@ -987,20 +1079,30 @@ def _cpfair_style_groups(run: PreparedRun) -> tuple[dict[int, int], dict[int, in
         user_id: ADVANTAGED_GROUP if user_id in active_users else PROTECTED_GROUP
         for user_id in range(len(user_activity))
     }
-    item_groups = _mapping_dict_for_cpfair(
-        _item_group_path(run, "CPFair"),
-        id_column="item_id",
-        value_column="item_group",
-    )
-    return user_groups, item_groups
+    return user_groups
+
+
+def _yelp_partition(run: PreparedRun, expected: str) -> None:
+    if run.dataset.lower() == "yelp" and _metadata(run.directory).get("yelp_partition") != expected:
+        raise ValueError(f"{run.directory} requires Yelp partition {expected}")
+
+
+def _eligible_scores(run: PreparedRun) -> torch.Tensor:
+    scores = run.scores.clone()
+    if run.eligible_items is not None:
+        if (run.eligible_items.sum(dim=1) < run.k).any():
+            raise ValueError("not enough eligible items for the requested k")
+        scores = scores.masked_fill(~run.eligible_items.to(scores.device), -torch.inf)
+    return scores
 
 
 def _run_cpfair(run: PreparedRun, config: RunnerConfig) -> MethodOutput:
     from pam.greedy_cpfair import cpfair
 
+    _yelp_partition(run, "cpfair-territorial")
     user_groups, item_groups = _cpfair_style_groups(run)
     scores, topk = cpfair(
-        run.scores.clone(),
+        _eligible_scores(run) if run.dataset.lower() == "yelp" else run.scores.clone(),
         user_groups=user_groups,
         item_groups=item_groups,
         base_topk=run.base_topk.detach().cpu().numpy(),
@@ -1065,25 +1167,46 @@ def _run_tfld(run: PreparedRun, config: RunnerConfig) -> MethodOutput:
     return _as_output(scores, _policy_to_topk(policy.detach().cpu(), run.k), run.k)
 
 
+def _tfld_group_vectors(
+    run: PreparedRun, config: RunnerConfig
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if run.dataset.lower() == "yelp":
+        partition = config.yelp_tfld_partition
+        _yelp_partition(run, partition)
+        user_groups = _activity_cpfair_groups(run)
+        item_group_values = _mapping_vector(
+            run.directory / "groups" / YELP_ITEM_GROUP_FILES[partition],
+            id_column="item_id",
+            value_column="item_group",
+            size=run.scores.shape[1],
+        )
+    else:
+        user_groups, item_groups = _cpfair_style_groups(run)
+        item_group_values = torch.tensor(
+            [item_groups[item_id] for item_id in range(run.scores.shape[1])],
+            dtype=torch.long,
+        )
+    user_group_values = torch.tensor(
+        [user_groups[user_id] for user_id in range(run.scores.shape[0])],
+        dtype=torch.long,
+    )
+    return user_group_values, item_group_values
+
+
 def _run_tfld_groups(run: PreparedRun, config: RunnerConfig) -> MethodOutput:
     from obm.tfld_groups import tfld_groups
 
-    user_groups, item_groups = _cpfair_style_groups(run)
+    user_groups, item_groups = _tfld_group_vectors(run, config)
     exposure, topk, _, _ = tfld_groups(
         run.scores.clone(),
-        user_groups=torch.tensor(
-            [user_groups[user_id] for user_id in range(run.scores.shape[0])],
-            dtype=torch.long,
-        ),
-        item_groups=torch.tensor(
-            [item_groups[item_id] for item_id in range(run.scores.shape[1])],
-            dtype=torch.long,
-        ),
+        user_groups=user_groups,
+        item_groups=item_groups,
         epochs=config.tfld_epochs,
         k=run.k,
         alpha=config.tfld_alpha,
         lamb=config.tfld_lambda,
         device=torch.device(config.device),
+        eligible_items=run.eligible_items if run.dataset.lower() == "yelp" else None,
     )
     return _as_output(exposure, topk, run.k)
 
@@ -1181,7 +1304,7 @@ def _fairness_metric(
     if group.number == 2:
         return utility_variance(
             _grouped_values(
-                user_ndcg, _group_vector(run, method, "user"), aggregation="mean"
+                user_ndcg, _group_vector(run, method, "user", config=config), aggregation="mean"
             )
         )
     if group.number == 3:
@@ -1209,7 +1332,7 @@ def _fairness_metric(
         return utility_variance(
             _grouped_values(
                 item_exposure,
-                _group_vector(run, method, "item"),
+                _group_vector(run, method, "item", config=config),
                 aggregation="sum",
             )
         )
@@ -1324,10 +1447,25 @@ def run_grouped_experiments(
     written: list[Path] = []
     for run_dir in directories:
         prepared = _load_prepared_run(run_dir, recommendation_list_size)
+        movielens_partition = (
+            prepared.dataset.lower() == "movielens"
+            and _metadata(prepared.directory).get("movielens_partition") == "director-gender"
+        )
+        director_run: PreparedRun | None = prepared if movielens_partition else None
         method_cache: dict[tuple[str, int], MethodOutput] = {}
         for group in groups:
             rows: list[dict[str, object]] = []
             for method in group.methods:
+                if movielens_partition and method not in {"CPFair", "TFLD-Groups"}:
+                    continue
+                method_run = prepared
+                if prepared.dataset.lower() == "movielens" and method in {"CPFair", "TFLD-Groups"}:
+                    if director_run is None:
+                        director_dir = run_dir.parent.parent / "director-gender" / run_dir.parent.name / run_dir.name
+                        if not director_dir.is_dir():
+                            raise FileNotFoundError(f"MovieLens director-gender run not found: {director_dir}; prepare with --movielens-director-gender")
+                        director_run = _load_prepared_run(director_dir, recommendation_list_size)
+                    method_run = director_run
                 # Group-specific adapters get their own cache entry; every other
                 # method is computed once per run and shared across groups.
                 group_adapter = _GROUP_ADAPTERS.get((method, group.number))
@@ -1340,17 +1478,19 @@ def run_grouped_experiments(
                             raise ValueError(
                                 f"unsupported method: {method}"
                             ) from error
-                    _seed_everything(prepared.seed)
-                    method_cache[cache_key] = group_adapter(prepared, resolved_config)
+                    _seed_everything(method_run.seed)
+                    method_cache[cache_key] = group_adapter(method_run, resolved_config)
                 rows.append(
                     _result_row(
-                        prepared,
+                        method_run,
                         method,
                         method_cache[cache_key],
                         group,
                         resolved_config,
                     )
                 )
+            if not rows:
+                continue
             output_path = (
                 results_base
                 / group.fairness_definition
@@ -1399,6 +1539,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--multifr-batch-size", type=_positive_int, default=64)
     parser.add_argument("--ggf-epochs", type=_positive_int, default=200)
     parser.add_argument("--tfld-epochs", type=_positive_int, default=200)
+    parser.add_argument(
+        "--include-tfld-groups", action="store_true",
+        help="Add TFLD-Groups to active CPFair comparisons 02 and 08.",
+    )
+    parser.add_argument(
+        "--yelp-tfld-partition", choices=YELP_ITEM_GROUP_FILES, default="tfld-metro",
+        help="Yelp partition used by TFLD-Groups (default: tfld-metro).",
+    )
     parser.add_argument("--tsfd-maxiter", type=_positive_int, default=500)
     parser.add_argument("--worse-off-fraction", type=float, default=0.25)
     parser.add_argument("--multifr-positive-threshold", type=float, default=0.8)
@@ -1428,12 +1576,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     ):
         raise ValueError("--multifr-positive-threshold must be non-negative")
 
+    groups = GROUPS
+    if args.include_tfld_groups:
+        groups = tuple(
+            replace(group, methods=(*group.methods, "TFLD-Groups"))
+            if group.number in {2, 8} and "CPFair" in group.methods and "TFLD-Groups" not in group.methods
+            else group
+            for group in groups
+        )
+
     paths = run_grouped_experiments(
         runs_root=args.runs_root,
         results_root=args.results_root,
         run_dirs=args.run_dir,
         datasets=args.dataset,
         recommendation_list_size=args.recommendation_list_size,
+        groups=groups,
         config=RunnerConfig(
             ada2fair_epochs=args.ada2fair_epochs,
             ada2fair_weight_epochs=args.ada2fair_weight_epochs,
@@ -1446,6 +1604,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             multifr_batch_size=args.multifr_batch_size,
             ggf_epochs=args.ggf_epochs,
             tfld_epochs=args.tfld_epochs,
+            yelp_tfld_partition=args.yelp_tfld_partition,
             tsfd_maxiter=args.tsfd_maxiter,
             worse_off_fraction=args.worse_off_fraction,
             multifr_positive_threshold=args.multifr_positive_threshold,

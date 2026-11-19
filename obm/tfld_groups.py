@@ -82,6 +82,7 @@ def tfld_groups(
     device: torch.device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     ),
+    eligible_items: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the two-sided Lorenz-dominance optimization over sensitive groups.
 
@@ -119,6 +120,9 @@ def tfld_groups(
         raise ValueError(f"k must be between 1 and the number of items ({M}), got {k}")
 
     S = scores.to(device)
+    eligible = torch.ones_like(S, dtype=torch.bool) if eligible_items is None else torch.as_tensor(eligible_items, dtype=torch.bool, device=device)
+    if eligible.shape != S.shape or (eligible.sum(dim=1) < k).any():
+        raise ValueError("eligible_items must match scores and provide at least k candidates per user")
     user_index = _dense_group_index(user_groups, size=N, name="user_groups").to(device)
     item_index = _dense_group_index(item_groups, size=M, name="item_groups").to(device)
     n_user_groups = int(user_index.max().item()) + 1
@@ -138,7 +142,7 @@ def tfld_groups(
     # recurrence is identical -- at k=150 this is ~150x less memory, and float32
     # avoids the fp16 step-size freeze logged against tfld.py.
     E = _exposure_from_topk(
-        torch.topk(S, k, dim=1).indices, M, v_exposure_weights
+        torch.topk(S.masked_fill(~eligible, -torch.inf), k, dim=1).indices, M, v_exposure_weights
     )
 
     # Frank-Wolfe
@@ -166,7 +170,7 @@ def tfld_groups(
 
         # Frank-Wolfe direction: the top-k of A per user (Theorem 1).
         E_tilde = _exposure_from_topk(
-            torch.topk(A, k, dim=1).indices, M, v_exposure_weights
+            torch.topk(A.masked_fill(~eligible, -torch.inf), k, dim=1).indices, M, v_exposure_weights
         )
 
         gamma = 2 / (t + 2)  # Step size
@@ -195,4 +199,4 @@ def tfld_groups(
     print("-" * 30)
     print("Optimization finished.")
 
-    return E, torch.topk(E, k, dim=1).indices, user_group_utils, item_group_utils
+    return E, torch.topk(E.masked_fill(~eligible, -torch.inf), k, dim=1).indices, user_group_utils, item_group_utils

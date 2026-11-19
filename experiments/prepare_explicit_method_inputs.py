@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Mapping, Sequence
@@ -23,6 +25,10 @@ DEFAULT_RUNS = 10
 DEFAULT_AMBAR_MAX_USERS = 5_000
 DEFAULT_AMBAR_MAX_ITEMS = 5_000
 DEFAULT_MAX_DENSE_CELLS = 25_000_000
+AMAZON_BRAND_METADATA = Path("raw_datasets/explicit_feedback/Amazon/meta_All_Beauty.json")
+UNKNOWN_AMAZON_BRANDS = frozenset({
+    "", "-", "generic", "n/a", "na", "no brand", "none", "not applicable", "unbranded", "unknown",
+})
 
 DATASETS: Mapping[str, str] = {
     "amazon": "raw_datasets/explicit_feedback/Amazon/All_Beauty.json",
@@ -484,9 +490,23 @@ def _provider_item_mapping(
     dataset: str,
     data_root: Path,
     original_items: Sequence[object],
+    amazon_brands: Mapping[str, str] | None = None,
 ) -> tuple[pd.DataFrame, str]:
     if dataset == "ambar":
         return _ambar_provider_item_mapping(data_root, original_items)
+    if amazon_brands is not None:
+        asins = pd.Series(original_items, dtype="string")
+        brands = asins.map(amazon_brands)
+        if brands.isna().any():
+            raise ValueError("Amazon brand partition requires a known brand for each retained ASIN")
+        provider_ids, _ = pd.factorize(brands, sort=True)
+        return pd.DataFrame({
+            "item_id": range(len(asins)),
+            "provider_id": provider_ids,
+            "asin": asins,
+            "brand": brands,
+            "provider_source": "amazon_product_metadata.brand",
+        }), "brand_from_amazon_product_metadata"
     return (
         pd.DataFrame(
             {
@@ -497,6 +517,21 @@ def _provider_item_mapping(
         ),
         "item_as_provider_proxy",
     )
+
+
+def _amazon_brands_by_asin(path: Path) -> dict[str, str]:
+    """Keep ASINs with exactly one known, normalized brand in the metadata."""
+    by_asin: dict[str, set[str]] = {}
+    with path.open(encoding="utf-8") as source:
+        for line in source:
+            row = json.loads(line)
+            asin, raw_brand = row.get("asin"), row.get("brand")
+            if not isinstance(asin, str) or not asin or not isinstance(raw_brand, str):
+                continue
+            brand = " ".join(raw_brand.casefold().split())
+            if brand not in UNKNOWN_AMAZON_BRANDS:
+                by_asin.setdefault(asin, set()).add(brand)
+    return {asin: next(iter(brands)) for asin, brands in by_asin.items() if len(brands) == 1}
 
 
 def _write_standard_interactions(interactions: pd.DataFrame, path: Path) -> None:
@@ -544,6 +579,29 @@ def _write_csv(frame: pd.DataFrame, path: Path) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame.to_csv(path, index=False)
     return path
+
+
+def _yelp_metro_groups(path: Path, original_items: Sequence[object]) -> pd.DataFrame:
+    """Align the Yelp business-region mapping with this run's item IDs."""
+    frame = pd.read_csv(path, dtype={"business_id": str})
+    required = {"business_id", "region", "region_code", "match_status"}
+    if missing := required.difference(frame.columns):
+        raise ValueError(f"{path} is missing required columns: {sorted(missing)}")
+    if frame["business_id"].isna().any() or frame["business_id"].duplicated().any():
+        raise ValueError(f"{path} must contain unique, nonmissing business IDs")
+    items = pd.DataFrame({"item_id": range(len(original_items)), "business_id": list(original_items)})
+    items["business_id"] = items["business_id"].astype(str)
+    groups = items.merge(frame[list(required)], on="business_id", how="left", validate="one_to_one", sort=False)
+    if groups[["region", "region_code", "match_status"]].isna().any(axis=None):
+        missing_items = groups.loc[groups["region"].isna(), "business_id"].tolist()
+        raise ValueError(f"{path} has missing region data for retained items: {missing_items[:5]}")
+    codes = pd.to_numeric(groups["region_code"], errors="coerce")
+    if codes.isna().any() or not codes.eq(np.floor(codes)).all() or not codes.between(-1, 10).all():
+        raise ValueError(f"{path} must contain integer region codes from -1 to 10")
+    groups["region_code"] = codes.astype(int)
+    return groups.rename(columns={"region_code": "item_group", "region": "group_label"})[
+        ["item_id", "item_group", "group_label", "business_id", "match_status"]
+    ]
 
 
 def _activity_groups(train: pd.DataFrame, users: int) -> pd.DataFrame:
@@ -743,14 +801,11 @@ def _copy_method_inputs(
 ) -> None:
     method_root.mkdir(parents=True, exist_ok=True)
     if user_groups is not None:
-        pd.read_csv(user_groups).to_csv(method_root / "user_group_mapping.csv", index=False)
+        shutil.copyfile(user_groups, method_root / "user_group_mapping.csv")
     if item_groups is not None:
-        pd.read_csv(item_groups).to_csv(method_root / "item_group_mapping.csv", index=False)
+        shutil.copyfile(item_groups, method_root / "item_group_mapping.csv")
     if provider_items is not None:
-        pd.read_csv(provider_items).to_csv(
-            method_root / "provider_item_mapping.csv",
-            index=False,
-        )
+        shutil.copyfile(provider_items, method_root / "provider_item_mapping.csv")
 
 
 def _write_run_groups(
@@ -763,6 +818,10 @@ def _write_run_groups(
     item_popularity_top_fraction: float,
     merit_quantiles: Sequence[float],
     allow_missing_demographics: bool,
+    yelp_partition: str | None = None,
+    movielens_director_gender: bool = False,
+    movielens_director_groups: pd.DataFrame | None = None,
+    amazon_brands: Mapping[str, str] | None = None,
 ) -> tuple[Path, Path, dict[str, object]]:
     train = pd.read_parquet(paths.train)
     train_matrix = _matrix_from_interactions(
@@ -781,25 +840,106 @@ def _write_run_groups(
 
     groups_dir = run_dir / "groups"
     method_dir = run_dir / "method_inputs"
+    metro_metadata: dict[str, object] = {}
+    metro_source = data_root / "mappings" / "yelp_metro" / "yelp_business_metro.csv"
+    if dataset == "yelp":
+        if metro_source.is_file():
+            metro_groups = _yelp_metro_groups(metro_source, mappings["items"])
+            metro_path = _write_csv(metro_groups, groups_dir / "yelp_item_metro.csv")
+            metro_metadata = {
+                "yelp_item_metro_source": str(metro_source),
+                "yelp_item_metro_mapping": str(metro_path),
+                "yelp_item_metro_unmatched": int((metro_groups["item_group"] == -1).sum()),
+            }
+        else:
+            if (groups_dir / "yelp_item_metro.csv").exists():
+                raise FileNotFoundError(
+                    f"{metro_source} is missing but an earlier geographic mapping exists "
+                    f"in {groups_dir}; restore the source or use a new run directory"
+                )
+            metro_metadata = {"yelp_item_metro_source": None, "yelp_item_metro_mapping": None}
+            print(f"Yelp metropolitan mapping not found at {metro_source}; skipping geographic groups")
     _write_csv(
         pd.DataFrame({"item_id": range(items), "merit": item_merit}),
         run_dir / "item_merit.csv",
     )
 
-    cpfair_user = _write_csv(
-        _activity_groups(train, users),
-        groups_dir / "cpfair_user_activity.csv",
-    )
-    cpfair_item = _write_csv(
-        _top_fraction_groups(
-            item_exposure,
-            id_column="item_id",
-            group_column="item_group",
-            value_column="train_exposure",
-            top_fraction=item_popularity_top_fraction,
-        ),
-        groups_dir / "cpfair_item_popularity.csv",
-    )
+    if dataset == "yelp":
+        cpfair_user = _write_csv(_activity_groups(train, users), groups_dir / "cpfair_user_activity.csv")
+        provider_frame, provider_semantics = _provider_item_mapping(
+            dataset=dataset, data_root=data_root, original_items=mappings["items"]
+        )
+        provider_items = _write_csv(provider_frame, run_dir / "provider_item_mapping.csv")
+        if yelp_partition == "cpfair-territorial":
+            source = data_root / "mappings/yelp_census/yelp_business_poverty.csv"
+            census = pd.read_csv(source, dtype={"business_id": str, "tract_id": str})
+            frame = pd.DataFrame({"item_id": range(items), "business_id": mappings["items"]}).merge(
+                census, on="business_id", how="left", validate="one_to_one", sort=False
+            )
+            if frame.item_group.isna().any() or set(frame.item_group) != {-1, 1}:
+                raise ValueError("Yelp territorial run must contain both known poverty groups")
+            frame["item_group"] = frame.item_group.astype(int)
+            frame["group_label"] = frame.item_group.map({1: "high_poverty", -1: "lower_poverty"})
+            item_path = _write_csv(frame, groups_dir / "yelp_item_poverty.csv")
+            _copy_method_inputs(method_dir / "CPFair", user_groups=cpfair_user, item_groups=item_path, provider_items=provider_items)
+            group_source = str(source)
+        elif yelp_partition == "tfld-metro":
+            if not metro_source.is_file():
+                raise FileNotFoundError(f"required metropolitan mapping not found: {metro_source}")
+            missing_groups = set(range(11)) - set(metro_groups.item_group)
+            if metro_groups.item_group.isna().any() or missing_groups or set(metro_groups.item_group) - set(range(11)):
+                raise ValueError(f"Yelp metro run must retain all 11 metropolitan groups; missing codes: {sorted(missing_groups)}")
+            item_path = groups_dir / "yelp_item_metro.csv"
+            _copy_method_inputs(method_dir / "TFLD-Groups", user_groups=cpfair_user, item_groups=item_path, provider_items=provider_items)
+            group_source = str(metro_source)
+        else:
+            raise ValueError("Yelp requires a valid partition")
+        return groups_dir, method_dir, {
+            **metro_metadata, "item_provider_semantics": provider_semantics,
+            "yelp_partition": yelp_partition, "yelp_group_source": group_source,
+            "yelp_item_group_mapping": str(item_path),
+            "yelp_item_group_counts": {str(k): int(v) for k, v in pd.read_csv(item_path).item_group.value_counts().items()},
+            "cpfair_user_groups": "training_user_activity_top_20_percent",
+        }
+
+    user_groups = _activity_groups(train, users)
+    cpfair_user_rule = "training_user_activity_median_split"
+    if amazon_brands is not None:
+        user_groups = _top_fraction_groups(
+            np.count_nonzero(train_matrix, axis=1),
+            id_column="user_id",
+            group_column="user_group",
+            value_column="train_interactions",
+            top_fraction=0.2,
+        )
+        user_groups["group_label"] = user_groups.user_group.map({0: "active", 1: "inactive"})
+        user_groups["user_group"] = user_groups.user_group.map({0: -1, 1: 1})
+        cpfair_user_rule = "training_user_activity_top_20_percent"
+    cpfair_user = _write_csv(user_groups, groups_dir / "cpfair_user_activity.csv")
+    cpfair_item_rule = "training_item_exposure_short_head_long_tail"
+    if amazon_brands is None:
+        cpfair_item = _write_csv(
+            _top_fraction_groups(
+                item_exposure,
+                id_column="item_id",
+                group_column="item_group",
+                value_column="train_exposure",
+                top_fraction=item_popularity_top_fraction,
+            ),
+            groups_dir / "cpfair_item_popularity.csv",
+        )
+    if dataset == "movielens" and movielens_director_gender:
+        if movielens_director_groups is None:
+            raise ValueError("MovieLens director groups are required for this partition")
+        director_groups = movielens_director_groups.set_index("movie_id")["item_group"]
+        original_items = [str(item) for item in mappings["items"]]
+        aligned = director_groups.reindex(original_items)
+        if aligned.isna().any() or set(aligned.astype(int)) != {-1, 1}:
+            raise ValueError("MovieLens director groups must cover all retained items and contain both groups")
+        cpfair_item = _write_csv(pd.DataFrame({
+            "item_id": range(items), "item_group": aligned.to_numpy(dtype=int),
+        }), groups_dir / "cpfair_item_director_gender.csv")
+        cpfair_item_rule = "director_gender"
     multifr_item = _write_csv(
         _top_fraction_groups(
             item_exposure,
@@ -824,6 +964,7 @@ def _write_run_groups(
         dataset=dataset,
         data_root=data_root,
         original_items=mappings["items"],
+        amazon_brands=amazon_brands,
     )
     provider_items = _write_csv(
         provider_frame,
@@ -839,6 +980,35 @@ def _write_run_groups(
         value_column="train_exposure",
         top_fraction=item_popularity_top_fraction,
     )
+    brand_metadata: dict[str, object] = {}
+    if amazon_brands is not None:
+        if set(provider_groups.provider_group) != {0, 1}:
+            raise ValueError("Amazon brand partition must contain both short-head and long-tail brands")
+        provider_groups = provider_groups.merge(
+            provider_frame[["provider_id", "brand"]].drop_duplicates(),
+            on="provider_id",
+            validate="one_to_one",
+        )
+        item_groups = provider_frame[["item_id", "provider_id", "asin", "brand"]].merge(
+            provider_groups[["provider_id", "provider_group", "group_label", "train_exposure"]],
+            on="provider_id",
+            validate="many_to_one",
+        )
+        item_groups["item_group"] = item_groups.pop("provider_group").map({0: -1, 1: 1})
+        item_groups = item_groups.rename(columns={"train_exposure": "brand_train_interactions"})
+        cpfair_item = _write_csv(item_groups, groups_dir / "cpfair_item_brand_popularity.csv")
+        shutil.copyfile(cpfair_item, paths.item_groups)
+        cpfair_item_rule = "training_brand_interactions_short_head_long_tail"
+        brand_metadata = {
+            "amazon_brand_group_counts": {
+                str(label): int(count)
+                for label, count in provider_groups.group_label.value_counts().items()
+            },
+            "amazon_brand_item_group_counts": {
+                str(label): int(count)
+                for label, count in item_groups.group_label.value_counts().items()
+            },
+        }
     provider_group_path = _write_csv(
         provider_groups,
         groups_dir / "provider_group_mapping.csv",
@@ -890,15 +1060,14 @@ def _write_run_groups(
         method_dir / "provider_defaults",
         provider_items=provider_items,
     )
-    pd.read_csv(provider_group_path).to_csv(
-        method_dir / "provider_defaults" / "provider_group_mapping.csv",
-        index=False,
-    )
+    shutil.copyfile(provider_group_path, method_dir / "provider_defaults" / "provider_group_mapping.csv")
 
     metadata = {
+        **metro_metadata,
+        **brand_metadata,
         "item_provider_semantics": provider_semantics,
-        "cpfair_user_groups": "training_user_activity_median_split",
-        "cpfair_item_groups": "training_item_exposure_short_head_long_tail",
+        "cpfair_user_groups": cpfair_user_rule,
+        "cpfair_item_groups": cpfair_item_rule,
         "multifr_user_groups": "real_gender_age_when_available",
         "multifr_item_groups": "training_item_exposure_short_head_long_tail",
         "tsfd_user_groups": "real_gender",
@@ -908,6 +1077,121 @@ def _write_run_groups(
         "missing_demographic_groups": missing_demographics,
     }
     return groups_dir, method_dir, metadata
+
+
+def _movielens_director_groups(data_root: Path) -> pd.DataFrame:
+    """Classify original movie IDs without guessing unknown director genders."""
+    path = data_root / "raw_datasets/explicit_feedback/Movie Lens/auxiliary_data/director_gender.csv"
+    if not path.is_file():
+        raise FileNotFoundError(f"MovieLens director metadata not found: {path}")
+    frame = pd.read_csv(path, dtype={"movie_id": str, "director_id": str, "gender_id": str})
+    required = {"movie_id", "director_id", "gender_id"}
+    if missing := required.difference(frame.columns):
+        raise ValueError(f"{path} is missing columns: {sorted(missing)}")
+    if frame.empty or frame.movie_id.isna().any():
+        raise ValueError(f"{path} must contain nonempty movie IDs")
+
+    def classify(rows: pd.DataFrame) -> int | None:
+        values = set(rows.gender_id.dropna())
+        if values.intersection({"Q6581072", "Q1052281"}):
+            return 1
+        if rows.director_id.notna().all() and rows.gender_id.notna().all() and values == {"Q6581097"}:
+            return -1
+        return None
+
+    classified = pd.DataFrame(
+        [(movie_id, classify(rows)) for movie_id, rows in frame.groupby("movie_id", sort=False)],
+        columns=["movie_id", "item_group"],
+    )
+    movies_path = data_root / "raw_datasets/explicit_feedback/Movie Lens/movies.dat"
+    if not movies_path.is_file():
+        raise FileNotFoundError(f"MovieLens movie metadata not found: {movies_path}")
+    movies = pd.read_csv(movies_path, sep="::", engine="python", encoding="latin-1",
+                         header=None, names=["movie_id", "title", "genres"], dtype={"movie_id": str})
+    if movies.empty or movies.movie_id.isna().any() or movies.movie_id.duplicated().any():
+        raise ValueError(f"{movies_path} must contain unique, nonempty movie IDs")
+    result = movies[["movie_id"]].merge(classified, on="movie_id", how="left", validate="one_to_one")
+    result["item_group"] = result["item_group"].astype("Int64")
+    return result
+
+
+def _ensure_yelp_mapping(data_root: Path, partition: str) -> Path:
+    """Build the selected dataset-wide Yelp mapping once, if it is missing."""
+    if partition not in {"cpfair-territorial", "tfld-metro"}:
+        raise ValueError(f"unsupported Yelp partition: {partition}")
+    census = partition == "cpfair-territorial"
+    target = data_root / (
+        "mappings/yelp_census/yelp_business_poverty.csv" if census
+        else "mappings/yelp_metro/yelp_business_metro.csv"
+    )
+    if target.is_file():
+        return target
+    yelp_root = data_root / "raw_datasets/explicit_feedback/Yelp"
+    business = yelp_root / "yelp_academic_dataset_business.json"
+    aux = yelp_root / "auxiliary_data"
+    if census:
+        tracts = aux / "census_acs_2019/cb_2019_us_tract_500k.zip"
+        poverty = aux / "census_acs_2019/acsdt5y2019-b17001.dat"
+        required = (business, tracts, poverty)
+    else:
+        us = aux / "boundaries/us_cbsa_2020/cb_2020_us_cbsa_500k.shp"
+        canada = aux / "boundaries/edmonton_cma_2021.geojson"
+        required = (business, us, canada)
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"Cannot generate Yelp {partition} mapping; missing input files: {missing}. "
+            "See data/mappings/README.md for the required auxiliary data."
+        )
+    try:
+        if census:
+            from .yelp_census_mapping import build_mapping
+
+            frame = build_mapping(business, tracts, poverty)
+            metadata = {
+                "businesses": str(business), "tracts": str(tracts), "poverty": str(poverty),
+                "tract_source": "https://www2.census.gov/geo/tiger/GENZ2019/shp/cb_2019_us_tract_500k.zip",
+                "poverty_source": "https://www2.census.gov/programs-surveys/acs/summary_file/2019/prototype/5YRData/acsdt5y2019-b17001.dat",
+                "poverty_measure": "ACS 2015-2019 B17001_E002 / B17001_E001 * 100",
+                "threshold_percent": 20,
+            }
+            metadata_path = target.with_suffix(".metadata.json")
+        else:
+            from .yelp_metro_mapping import REGION_CODES, load_boundaries, map_businesses
+
+            frame = map_businesses(business, load_boundaries(us, canada))
+            metadata = {"businesses": str(business), "us_boundaries": str(us),
+                        "canada_boundaries": str(canada), "region_codes": REGION_CODES,
+                        "unknown_code": -1}
+            metadata_path = target.parent / "yelp_metro_metadata.json"
+    except ModuleNotFoundError as error:
+        if error.name == "geopandas":
+            raise ValueError("Generating Yelp mappings requires geopandas; run uv sync --extra geographic") from error
+        raise
+    target.parent.mkdir(parents=True, exist_ok=True)
+    frame.to_csv(target, index=False)
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    print(f"Generated Yelp {partition} mapping: {target}", flush=True)
+    return target
+
+
+def _write_movielens_gender_mapping(data_root: Path) -> Path:
+    source = data_root / "raw_datasets" / "explicit_feedback" / "Movie Lens" / "users.dat"
+    if not source.is_file():
+        raise FileNotFoundError(f"MovieLens user metadata not found: {source}")
+    users = pd.read_csv(
+        source, sep="::", engine="python", header=None,
+        names=["user_id", "gender", "age", "occupation", "zip_code"],
+    )[["user_id", "gender"]]
+    if users.empty or users["user_id"].isna().any() or users["user_id"].duplicated().any():
+        raise ValueError(f"{source} must contain unique, nonempty user IDs")
+    if not users["gender"].isin(["F", "M"]).all():
+        raise ValueError(f"{source} must contain gender F or M for every user")
+    users["user_group"] = users["gender"].map({"F": 1, "M": -1})
+    destination = data_root / "mappings" / "movielens_user_gender_mapping.csv"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    users.to_csv(destination, index=False)
+    return destination
 
 
 def _write_shared_run_zero_artifacts(
@@ -924,28 +1208,22 @@ def _write_shared_run_zero_artifacts(
     evaluation_dir.mkdir(parents=True, exist_ok=True)
     mapping_dir.mkdir(parents=True, exist_ok=True)
 
+    if dataset == "movielens":
+        _write_movielens_gender_mapping(data_root)
+
     relevance = pd.read_parquet(run_dir / "heldout_relevance.parquet")
     relevance.to_parquet(evaluation_dir / f"{dataset}_relevance.parquet", index=False)
     merit = relevance.mean(axis=0).reset_index()
     merit.columns = ["item_id", "merit"]
     merit.to_csv(evaluation_dir / f"{dataset}_merit.csv", index=False)
 
-    pd.read_csv(run_dir / "groups" / "cpfair_user_activity.csv").to_csv(
-        mapping_dir / f"{dataset}_user_group_mapping.csv",
-        index=False,
-    )
-    pd.read_csv(run_dir / "groups" / "cpfair_item_popularity.csv").to_csv(
-        mapping_dir / f"{dataset}_item_group_mapping.csv",
-        index=False,
-    )
-    pd.read_csv(run_dir / "provider_item_mapping.csv").to_csv(
-        mapping_dir / f"{dataset}_provider_item_mapping.csv",
-        index=False,
-    )
-    pd.read_csv(run_dir / "groups" / "provider_group_mapping.csv").to_csv(
-        mapping_dir / f"{dataset}_provider_group_mapping.csv",
-        index=False,
-    )
+    for name, source in (
+        ("user_group_mapping", run_dir / "method_inputs" / "CPFair" / "user_group_mapping.csv"),
+        ("item_group_mapping", run_dir / "method_inputs" / "CPFair" / "item_group_mapping.csv"),
+        ("provider_item_mapping", run_dir / "provider_item_mapping.csv"),
+        ("provider_group_mapping", run_dir / "groups" / "provider_group_mapping.csv"),
+    ):
+        shutil.copyfile(source, mapping_dir / f"{dataset}_{name}.csv")
 
 
 def prepare_dataset_run(
@@ -971,6 +1249,9 @@ def prepare_dataset_run(
     max_users: int | None = None,
     max_items: int | None = None,
     max_dense_cells: int | None = DEFAULT_MAX_DENSE_CELLS,
+    yelp_partition: str | None = None,
+    movielens_director_gender: bool = False,
+    amazon_brand: bool = False,
 ) -> PreparedRun:
     """Prepare one run of one explicit dataset for method experiments."""
 
@@ -978,12 +1259,21 @@ def prepare_dataset_run(
         raise ValueError(f"unsupported dataset {dataset!r}; choose from {sorted(DATASETS)}")
     if run < 0 or seed < 0:
         raise ValueError("seed and run must be non-negative")
+    if dataset == "yelp" and yelp_partition not in {"cpfair-territorial", "tfld-metro"}:
+        raise ValueError("Yelp requires --yelp-partition cpfair-territorial or tfld-metro")
     _validate_optional_positive(max_users, "max_users")
     _validate_optional_positive(max_items, "max_items")
     _validate_optional_positive(max_dense_cells, "max_dense_cells")
 
     data_root_path = Path(data_root)
     output_root_path = Path(output_root)
+    amazon_brands = (
+        _amazon_brands_by_asin(data_root_path / AMAZON_BRAND_METADATA)
+        if dataset == "amazon" and amazon_brand
+        else None
+    )
+    if dataset == "yelp":
+        _ensure_yelp_mapping(data_root_path, yelp_partition)
     effective_seed = seed + run
     raw_path = data_root_path / DATASETS[dataset]
     print(f"Preparing {dataset} run {run:02d} seed {effective_seed}: reading {raw_path}")
@@ -1000,6 +1290,65 @@ def prepare_dataset_run(
         "preprocessing_original_users": int(interactions["user_id"].nunique()),
         "preprocessing_original_items": int(interactions["item_id"].nunique()),
     }
+    if amazon_brands is not None:
+        before = interactions
+        interactions = interactions[interactions.item_id.astype(str).isin(amazon_brands)].copy()
+        if interactions.empty:
+            raise ValueError("Amazon brand partition contains no reviews with an identified brand")
+        preprocessing_metadata.update({
+            "amazon_partition": "brand",
+            "amazon_brand_metadata_source": str(data_root_path / AMAZON_BRAND_METADATA),
+            "amazon_brand_dropped_interactions": len(before) - len(interactions),
+            "amazon_brand_dropped_users": int(before.user_id.nunique() - interactions.user_id.nunique()),
+            "amazon_brand_dropped_items": int(before.item_id.nunique() - interactions.item_id.nunique()),
+        })
+    director_groups: pd.DataFrame | None = None
+    if dataset == "movielens" and movielens_director_gender:
+        director_groups = _movielens_director_groups(data_root_path)
+        mapping_path = data_root_path / "mappings" / "movielens_item_director_gender_mapping.csv"
+        mapping_bytes = director_groups.to_csv(index=False, lineterminator="\n").encode("utf-8")
+        if write_shared_run_zero:
+            mapping_path.parent.mkdir(parents=True, exist_ok=True)
+            mapping_path.write_bytes(mapping_bytes)
+        auxiliary_path = data_root_path / "raw_datasets/explicit_feedback/Movie Lens/auxiliary_data/director_gender.csv"
+        known = set(director_groups.loc[director_groups.item_group.notna(), "movie_id"])
+        before = interactions
+        interactions = interactions[interactions.item_id.astype(str).isin(known)].copy()
+        preprocessing_metadata.update({
+            "movielens_partition": "director-gender",
+            "movielens_director_mapping_source": str(mapping_path) if write_shared_run_zero else "in_memory",
+            "movielens_director_mapping_sha256": hashlib.sha256(mapping_bytes).hexdigest(),
+            "movielens_director_auxiliary_source": str(auxiliary_path),
+            "movielens_director_auxiliary_sha256": hashlib.sha256(auxiliary_path.read_bytes()).hexdigest(),
+            "movielens_director_group_rule": "any_female_or_trans_woman_protected; all_male_reference; otherwise_unknown",
+            "movielens_director_mapping_movies": len(director_groups),
+            "movielens_director_mapping_unknown_movies": int(director_groups.item_group.isna().sum()),
+            "movielens_director_dropped_interactions": len(before) - len(interactions),
+            "movielens_director_dropped_users": int(before.user_id.nunique() - interactions.user_id.nunique()),
+            "movielens_director_dropped_items": int(before.item_id.nunique() - interactions.item_id.nunique()),
+        })
+        if interactions.empty:
+            raise ValueError("MovieLens director-gender partition contains no interactions")
+    if dataset == "yelp":
+        source = data_root_path / ("mappings/yelp_census/yelp_business_poverty.csv" if yelp_partition == "cpfair-territorial" else "mappings/yelp_metro/yelp_business_metro.csv")
+        groups = pd.read_csv(source, dtype={"business_id": str})
+        if groups.business_id.duplicated().any():
+            raise ValueError(f"{source} contains duplicate business IDs")
+        selected_groups = groups[groups.match_status.eq("matched")]
+        if yelp_partition == "cpfair-territorial":
+            selected_groups = selected_groups[selected_groups.item_group.isin([-1, 1])]
+        else:
+            selected_groups = selected_groups[selected_groups.region_code.isin(range(11))]
+        before = interactions
+        interactions = interactions[interactions.item_id.astype(str).isin(set(selected_groups.business_id))].copy()
+        preprocessing_metadata.update({
+            "yelp_partition": yelp_partition, "yelp_partition_source": str(source),
+            "yelp_partition_dropped_interactions": len(before) - len(interactions),
+            "yelp_partition_dropped_users": int(before.user_id.nunique() - interactions.user_id.nunique()),
+            "yelp_partition_dropped_items": int(before.item_id.nunique() - interactions.item_id.nunique()),
+        })
+        if interactions.empty:
+            raise ValueError("Yelp partition contains no interactions")
     if dataset == "ambar":
         interactions, dropped_interactions_without_user_attributes = (
             _filter_interactions_to_attributed_users(interactions, attributes)
@@ -1044,7 +1393,12 @@ def prepare_dataset_run(
         )
     preprocessing_metadata["preprocessing_dense_cells"] = dense_cells
 
-    run_dir = _run_seed_directory(output_root_path, dataset, run, effective_seed)
+    if amazon_brands is not None:
+        run_dir = _run_seed_directory(output_root_path / "amazon", "brand", run, effective_seed)
+    elif dataset == "movielens" and movielens_director_gender:
+        run_dir = _run_seed_directory(output_root_path / "movielens", "director-gender", run, effective_seed)
+    else:
+        run_dir = _run_seed_directory(output_root_path / "yelp" if dataset == "yelp" else output_root_path, yelp_partition if dataset == "yelp" else dataset, run, effective_seed)
     run_dir.mkdir(parents=True, exist_ok=True)
     standardized_path = run_dir / "standardized_interactions.tsv"
     _write_standard_interactions(interactions, standardized_path)
@@ -1068,6 +1422,7 @@ def prepare_dataset_run(
         batch_size=batch_size,
         learning_rate=learning_rate,
         regularization=regularization,
+        generate_item_groups=dataset != "yelp" and amazon_brands is None,
     )
 
     train = pd.read_parquet(core_paths.train)
@@ -1113,6 +1468,10 @@ def prepare_dataset_run(
         item_popularity_top_fraction=item_popularity_top_fraction,
         merit_quantiles=merit_quantiles,
         allow_missing_demographics=allow_missing_demographics,
+        yelp_partition=yelp_partition,
+        movielens_director_gender=movielens_director_gender,
+        movielens_director_groups=director_groups,
+        amazon_brands=amazon_brands,
     )
 
     metadata_path = run_dir / "metadata.json"
@@ -1142,9 +1501,11 @@ def prepare_dataset_run(
         encoding="utf-8",
     )
 
-    if write_shared_run_zero:
+    if write_shared_run_zero and dataset == "movielens" and movielens_director_gender and run == 0:
+        _write_movielens_gender_mapping(data_root_path)
+    elif write_shared_run_zero and dataset != "yelp" and not (dataset == "movielens" and movielens_director_gender):
         _write_shared_run_zero_artifacts(
-            dataset=dataset,
+            dataset="amazon_brand" if amazon_brands is not None else dataset,
             run=run,
             run_dir=run_dir,
             data_root=data_root_path,
@@ -1189,12 +1550,17 @@ def prepare_explicit_method_inputs(
     max_users: int | None = None,
     max_items: int | None = None,
     max_dense_cells: int | None = DEFAULT_MAX_DENSE_CELLS,
+    yelp_partition: str | None = None,
+    movielens_director_gender: bool = False,
+    amazon_brand: bool = False,
 ) -> list[PreparedRun]:
     """Prepare all requested explicit datasets and runs."""
 
     if runs <= 0:
         raise ValueError("runs must be positive")
     selected = list(DATASETS if datasets is None else datasets)
+    if "yelp" in selected and yelp_partition not in {"cpfair-territorial", "tfld-metro"}:
+        raise ValueError("Yelp requires --yelp-partition cpfair-territorial or tfld-metro")
     prepared: list[PreparedRun] = []
     for dataset in selected:
         for run in range(runs):
@@ -1221,6 +1587,9 @@ def prepare_explicit_method_inputs(
                     max_users=max_users,
                     max_items=max_items,
                     max_dense_cells=max_dense_cells,
+                    yelp_partition=yelp_partition,
+                    movielens_director_gender=movielens_director_gender,
+                    amazon_brand=amazon_brand,
                 )
             )
     return prepared
@@ -1231,6 +1600,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets", nargs="+", choices=sorted(DATASETS))
+    parser.add_argument("--amazon-brand", action="store_true", help="Prepare a separate Amazon partition grouped by brand demand in training.")
+    parser.add_argument("--yelp-partition", choices=["cpfair-territorial", "tfld-metro"], help="Required when preparing Yelp")
+    parser.add_argument("--movielens-director-gender", action="store_true", help="Prepare a separate MovieLens partition grouped by director gender.")
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
@@ -1316,6 +1688,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_users=args.max_users,
             max_items=args.max_items,
             max_dense_cells=args.max_dense_cells,
+            yelp_partition=args.yelp_partition,
+            movielens_director_gender=args.movielens_director_gender,
+            amazon_brand=args.amazon_brand,
         )
     except (FileNotFoundError, OSError, TypeError, ValueError) as error:
         raise SystemExit(str(error)) from error

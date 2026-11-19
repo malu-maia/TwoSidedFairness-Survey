@@ -1,5 +1,6 @@
 # Local Python environment
 /.venv/
+/uv.lock
 
 # Python-generated files
 __pycache__/
@@ -10,14 +11,20 @@ htmlcov/
 .mypy_cache/
 .ruff_cache/
 
+# Local tests
+/tests/
+
 # Generated experiment inputs
 /experiments/runs/
 
 # Generated experiment outputs
 /results/
+/results_11/
 
-# Raw datasets: store/download separately
-/data/raw_datasets/
+# Raw datasets: keep the directory layout, but download the data separately
+/data/raw_datasets/**
+!/data/raw_datasets/**/
+!/data/raw_datasets/**/.gitkeep
 
 # Derived run-zero copies
 /data/evaluation/

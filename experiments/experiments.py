@@ -318,6 +318,7 @@ def prepare_experiment(
     provider_item_mapping: str | Path | None = None,
     item_group_mapping: str | Path | None = None,
     popularity_top_fraction: float = 0.2,
+    generate_item_groups: bool = True,
 ) -> ExperimentPaths:
     """Prepare aligned held-out data, MF predictions, groups, and providers."""
 
@@ -362,7 +363,7 @@ def prepare_experiment(
         _encode_mapping(Path(item_group_mapping), item_ids, "item_group")
         if item_group_mapping
         else _popularity_groups(train_original, item_ids, popularity_top_fraction)
-    )
+    ) if generate_item_groups else None
     providers = (
         _encode_mapping(Path(provider_item_mapping), item_ids, "provider_id")
         if provider_item_mapping
@@ -412,7 +413,8 @@ def prepare_experiment(
     pd.DataFrame(test_matrix).to_parquet(paths.test_relevance, index=False)
     pd.DataFrame(train_matrix == 0).to_parquet(paths.eligible_items, index=False)
 
-    groups.to_csv(paths.item_groups, index=False)
+    if groups is not None:
+        groups.to_csv(paths.item_groups, index=False)
     if providers is not None and provider_path is not None:
         providers.to_csv(provider_path, index=False)
 
@@ -450,7 +452,7 @@ def prepare_experiment(
         "best_epoch": best_epoch,
         "validation_ndcg": validation_ndcg,
         "patience": patience,
-        "item_group_source": str(item_group_mapping) if item_group_mapping else "training_popularity",
+        "item_group_source": (str(item_group_mapping) if item_group_mapping else "training_popularity") if generate_item_groups else None,
         "provider_mapping_source": str(provider_item_mapping) if provider_item_mapping else None,
         "generated_groups_are_providers": False,
         "popularity_top_fraction": popularity_top_fraction,

@@ -1,9 +1,9 @@
 """Evaluate whether the group fairness methods attend to underserved groups.
 
-For Amazon, MovieLens, and Yelp, underserved consumers are the bottom 80% by
-training activity and underserved providers are long-tail providers. For
-AMBAR, female consumers and female artist-providers are protected using the
-gender attributes in the raw dataset.
+For Amazon, underserved consumers are the bottom 80% by training activity.
+For MovieLens and AMBAR, female consumers are protected using gender attributes;
+MovieLens protects films with a female director and AMBAR female artist-providers.
+Yelp uses separate poverty-based CPFair and metropolitan TFLD-Groups runs.
 
 Provider attention is cumulative log-discounted exposure. Consumer utility is
 the sum of held-out per-user NDCG. Both metrics are compared on the same run
@@ -349,6 +349,20 @@ def analyze_run(
         )
         provider_group_label = "female artist"
         consumer_group_label = "female"
+    elif dataset == "movielens":
+        user_groups = experiment_pipeline._gender_cpfair_groups(run)
+        underserved_users = _protected_mask(
+            user_groups, range(run.scores.shape[0]), name="MovieLens consumer gender groups"
+        )
+        _, item_groups = experiment_pipeline._cpfair_style_groups(run)
+        provider_groups = {}
+        for item_id, provider_id in enumerate(run.provider_ids.tolist()):
+            group = item_groups[item_id]
+            if provider_id in provider_groups and provider_groups[provider_id] != group:
+                raise ValueError("MovieLens provider has conflicting director gender groups")
+            provider_groups[provider_id] = group
+        provider_group_label = "film directed by a woman"
+        consumer_group_label = "female"
     else:
         user_groups = _activity_user_groups(run)
         underserved_users = _protected_mask(
@@ -376,7 +390,7 @@ def analyze_run(
         _protected_mask(
             provider_groups,
             provider_ids.tolist(),
-            name="AMBAR provider gender groups",
+            name=f"{run.dataset} provider gender groups",
         )
         if provider_groups is not None
         else _underserved_provider_mask(run, provider_ids)
@@ -540,6 +554,10 @@ def discover_dataset_runs(runs_root: str | Path, dataset: str) -> list[Path]:
     directories = sorted(
         path for path in dataset_root.glob("run_*/seed_*") if path.is_dir()
     )
+    if normalized_dataset == "yelp":
+        directories = sorted(path for path in dataset_root.glob("*/run_*/seed_*") if path.is_dir())
+    elif normalized_dataset == "movielens":
+        directories = sorted(path for path in (dataset_root / "director-gender").glob("run_*/seed_*") if path.is_dir())
     if not directories:
         raise FileNotFoundError(
             f"no prepared {normalized_dataset} runs found under {dataset_root}. "
@@ -548,6 +566,53 @@ def discover_dataset_runs(runs_root: str | Path, dataset: str) -> list[Path]:
             f"--datasets {normalized_dataset}"
         )
     return directories
+
+
+def _yelp_partition_for_method(method: str, config: experiment_pipeline.RunnerConfig) -> str:
+    return "cpfair-territorial" if method == "cpfair" else config.yelp_tfld_partition
+
+
+def analyze_yelp_run(run: experiment_pipeline.PreparedRun, method: str, config: experiment_pipeline.RunnerConfig, results_root: Path) -> Path:
+    """Save paired exposure and user utility per actual Yelp group."""
+    partition = _yelp_partition_for_method(method, config)
+    experiment_pipeline._yelp_partition(run, partition)
+    if run.eligible_items is not None:
+        if (run.eligible_items.sum(dim=1) < run.k).any():
+            raise ValueError("not enough eligible candidates for Yelp baseline")
+        if not run.eligible_items.gather(1, run.base_topk).all():
+            raise ValueError("Yelp baseline contains ineligible items")
+    output = getattr(experiment_pipeline, _METHOD_RUNNERS[method])(run, config)
+    if run.eligible_items is not None and not run.eligible_items.gather(1, output.topk).all():
+        raise ValueError("Yelp fair ranking contains ineligible items")
+    group_file = run.directory / "groups" / experiment_pipeline.YELP_ITEM_GROUP_FILES[partition]
+    groups = pd.read_csv(group_file).sort_values("item_id")
+    if groups.item_id.tolist() != list(range(run.scores.shape[1])):
+        raise ValueError(f"{group_file} must contain one row per item")
+    exposure_before = experiment_pipeline._exposure(run.base_topk, num_items=run.scores.shape[1], k=run.k)
+    exposure_after = experiment_pipeline._exposure(output.topk, num_items=run.scores.shape[1], k=run.k)
+    before_ndcg = ndcg(run.heldout_relevance, run.base_topk, k=run.k).values.to(torch.float64)
+    after_ndcg = ndcg(run.heldout_relevance, output.topk, k=run.k).values.to(torch.float64)
+    user_groups = _activity_user_groups(run)
+    rows = []
+    for group, frame in groups.groupby("item_group", sort=True):
+        ids = torch.tensor(frame.item_id.tolist(), dtype=torch.long)
+        rows.append({"stakeholder": "provider", "group": str(frame.group_label.iloc[0]), "group_id": int(group),
+                     "count": len(ids), "total_before": float(exposure_before[ids].sum()),
+                     "total_after": float(exposure_after[ids].sum()),
+                     "mean_before": float(exposure_before[ids].mean()), "mean_after": float(exposure_after[ids].mean())})
+    for label, ids in [("all", list(user_groups)), ("less_active", [i for i, v in user_groups.items() if v == 1]),
+                       ("more_active", [i for i, v in user_groups.items() if v == -1])]:
+        idx = torch.tensor(ids, dtype=torch.long)
+        rows.append({"stakeholder": "consumer_ndcg", "group": label, "group_id": "", "count": len(ids),
+                     "total_before": float(before_ndcg[idx].sum()), "total_after": float(after_ndcg[idx].sum()),
+                     "mean_before": float(before_ndcg[idx].mean()), "mean_after": float(after_ndcg[idx].mean())})
+    destination = results_root / "RQ3_groups" / "yelp" / method / f"run_{run.run:02d}" / f"seed_{run.seed}" / f"k_{run.k}"
+    destination.mkdir(parents=True, exist_ok=True)
+    _topk_frame(run.base_topk).to_parquet(destination / "topk_before.parquet", index=False)
+    _topk_frame(output.topk).to_parquet(destination / "topk_after.parquet", index=False)
+    result = destination / "group_comparison.tsv"
+    pd.DataFrame(rows).assign(dataset="yelp", partition=partition, method=method, seed=run.seed, run=run.run, k=run.k).to_csv(result, sep="\t", index=False)
+    return result
 
 
 def _percent_change(before: float, after: float) -> float:
@@ -792,6 +857,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Frank-Wolfe iterations used by TFLD-Groups (default: 200).",
     )
     parser.add_argument(
+        "--yelp-tfld-partition",
+        choices=experiment_pipeline.YELP_ITEM_GROUP_FILES,
+        default="tfld-metro",
+        help="Yelp partition used by TFLD-Groups (default: tfld-metro).",
+    )
+    parser.add_argument(
         "--tfld-alpha",
         type=float,
         nargs=2,
@@ -833,6 +904,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     config = experiment_pipeline.RunnerConfig(
         device=args.device,
         tfld_epochs=args.tfld_epochs,
+        yelp_tfld_partition=args.yelp_tfld_partition,
         tfld_alpha=tuple(args.tfld_alpha),
         tfld_lambda=args.tfld_lambda,
     )
@@ -859,10 +931,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{run.directory} belongs to dataset {run.dataset!r}, "
                     f"not one of the selected datasets {selected_datasets}"
                 )
+        yelp_runs = [run for run in prepared_runs if run.dataset.lower() == "yelp"]
+        yelp_files = []
+        for method in selected_methods:
+            expected = _yelp_partition_for_method(method, config)
+            matching = [run for run in yelp_runs if experiment_pipeline._metadata(run.directory).get("yelp_partition") == expected]
+            if yelp_runs and not matching:
+                raise ValueError(f"no Yelp runs with partition {expected} for {method}")
+            yelp_files.extend(analyze_yelp_run(run, method, config, args.results_root) for run in matching)
         analyses = [
             analyze_run(run, method=method, config=config)
             for method in selected_methods
             for run in prepared_runs
+            if run.dataset.lower() != "yelp"
         ]
         ranking_files = [
             save_topk_rankings(analysis, args.results_root)
@@ -884,6 +965,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.exit(2, f"error: {error}\n")
     for comparisons in dataset_comparisons:
         print_report(comparisons)
+    for path in yelp_files:
+        print(f"Saved Yelp group comparison: {path}")
     print_saved_rankings(ranking_files)
     return 0
 

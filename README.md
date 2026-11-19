@@ -106,7 +106,7 @@ curl --fail --location \
 
 #### Amazon All Beauty
 
-Use the **All Beauty** per-category files from the [Amazon Review Data (2018) source](https://cseweb.ucsd.edu/~jmcauley/datasets/amazon_v2/index.html). `All_Beauty.json` is required. Product metadata is not read by the current experiment pipeline, so `meta_All_Beauty.json` is optional.
+Use the **All Beauty** per-category files from the [Amazon Review Data (2018) source](https://cseweb.ucsd.edu/~jmcauley/datasets/amazon_v2/index.html). `All_Beauty.json` is required for all Amazon runs. The `--amazon-brand` partition also requires `meta_All_Beauty.json`.
 
 ```bash
 curl --fail --location \
@@ -115,7 +115,7 @@ curl --fail --location \
 gzip --decompress data/raw_datasets/explicit_feedback/Amazon/All_Beauty.json.gz
 ```
 
-Optional product metadata:
+Product metadata for the brand partition:
 
 ```bash
 curl --fail --location \
@@ -126,7 +126,7 @@ gzip --decompress data/raw_datasets/explicit_feedback/Amazon/meta_All_Beauty.jso
 
 #### MovieLens 1M
 
-Download the stable [MovieLens 1M archive](https://grouplens.org/datasets/movielens/1m/). `ratings.dat` and `users.dat` are used by preprocessing; `movies.dat` and `README` are retained as the accompanying official documentation and metadata.
+Download the stable [MovieLens 1M archive](https://grouplens.org/datasets/movielens/1m/). Preprocessing uses `ratings.dat` and `users.dat`. The director-gender partition also requires `movies.dat`.
 
 ```bash
 curl --fail --location \
@@ -153,7 +153,9 @@ yelp_academic_dataset_tip.json
 yelp_academic_dataset_user.json
 ```
 
-Only `yelp_academic_dataset_review.json` is read by the current preprocessing pipeline. The other files are optional companion data from the official archive.
+Preparation reads `yelp_academic_dataset_review.json`; it also reads
+`yelp_academic_dataset_business.json` when it needs to generate a geographic
+mapping. The other files are optional companion data from the official archive.
 
 #### Black Friday
 
@@ -182,15 +184,15 @@ data/raw_datasets/
 │   │   └── users_info.csv
 │   ├── Amazon/
 │   │   ├── All_Beauty.json
-│   │   └── meta_All_Beauty.json              # optional
+│   │   └── meta_All_Beauty.json              # required for --amazon-brand
 │   ├── Movie Lens/
 │   │   ├── README
-│   │   ├── movies.dat                         # optional
+│   │   ├── movies.dat                         # required for --movielens-director-gender
 │   │   ├── ratings.dat
 │   │   └── users.dat
 │   └── Yelp/
 │       ├── Dataset_User_Agreement.pdf         # optional companion file
-│       ├── yelp_academic_dataset_business.json # optional
+│       ├── yelp_academic_dataset_business.json # required to build geographic mappings
 │       ├── yelp_academic_dataset_checkin.json  # optional
 │       ├── yelp_academic_dataset_review.json
 │       ├── yelp_academic_dataset_tip.json      # optional
@@ -200,7 +202,7 @@ data/raw_datasets/
         └── black_friday.csv
 ```
 
-Verify the files required by the complete experiment workflow:
+Verify the common raw data files. The [group-fairness commands](#prepare-group-fairness-inputs) list additional inputs for each partition.
 
 ```bash
 test -f data/raw_datasets/explicit_feedback/AMBAR/ratings_info.csv && \
@@ -217,30 +219,9 @@ echo 'All required raw dataset files are present.'
 
 ## 1. Prepare inputs
 
-The `--datasets` option accepts one or more dataset names after a single flag. If it is omitted, all supported datasets are prepared. The default is 10 runs, which can be expensive, so selecting datasets and setting `--runs` explicitly is recommended.
-
-For example, prepare three MovieLens and Yelp runs, with seeds 42, 43, and 44 and a baseline recommendation length of 50:
-
-```bash
-uv run python -m experiments.prepare_explicit_method_inputs \
-  --datasets movielens yelp \
-  --runs 3 \
-  --seed 42 \
-  --recommendation-list-length 50
-```
-
-A smaller development run can limit the dense user-item matrices and reduce matrix-factorization training:
-
-```bash
-uv run python -m experiments.prepare_explicit_method_inputs \
-  --datasets movielens \
-  --runs 1 \
-  --max-users 500 \
-  --max-items 1000 \
-  --epochs 5 \
-  --patience 2 \
-  --recommendation-list-length 20
-```
+Use `--datasets` to select one or more datasets. Omitting it selects all
+supported datasets and requires `--yelp-partition`. The default is 10 runs per
+dataset.
 
 Useful preprocessing options include:
 
@@ -251,6 +232,147 @@ Useful preprocessing options include:
 - `--recommendation-list-length` for the size of top-k ranking.
 - `--max-users`, `--max-items`, and `--max-dense-cells` for memory control when computational resources are limited. The filtering procedure first retained the `(max-items)` items with the largest numbers of interaction records, removed users who had interacted with fewer than three distinct retained items (to have at least one record for training, validation and test), and then retained the `(max-users)` users with the largest numbers of distinct interactions with those items.
 - `--allow-missing-demographics` to skip demographic group files that cannot be constructed from real attributes.
+
+### Prepare group-fairness inputs
+
+Run these commands from the repository root after downloading the data. Each
+command prepares one run with seed 42. The limits of 3,500 users and 3,500 items
+in the AMBAR, MovieLens, and Yelp commands are upper bounds. The final run may
+contain fewer users and items after filtering and splitting.
+
+#### AMBAR consumer and artist gender
+
+Use the four files listed under [AMBAR downloads](#ambar). Preparation writes
+the track-to-artist mapping to `provider_item_mapping.csv` under
+`experiments/runs/ambar/run_00/seed_42/`. At runtime, the runner uses
+`users_info.csv` for consumer gender and `artists_info.csv` for provider
+gender. On both sides, `F`/`female` maps to the protected group (`+1`), and
+other recorded values, including `undefined`, map to the reference group
+(`-1`).
+
+```bash
+uv run python -m experiments.prepare_explicit_method_inputs \
+  --datasets ambar --runs 1 --seed 42 --max-users 3500 --max-items 3500
+```
+
+#### MovieLens consumer and director gender
+
+Download MovieLens 1M and generate `Movie Lens/auxiliary_data/director_gender.csv`
+using the [director mapping instructions](data/mappings/README.md#movielens-directors).
+The grouped runner pairs the standard run with the director-gender run. Keep
+the run count, seed, and preprocessing limits the same in both commands.
+
+```bash
+uv run python -m experiments.prepare_explicit_method_inputs \
+  --datasets movielens --runs 1 --seed 42 --max-users 3500 --max-items 3500
+uv run python -m experiments.prepare_explicit_method_inputs \
+  --datasets movielens --movielens-director-gender \
+  --runs 1 --seed 42 --max-users 3500 --max-items 3500
+```
+
+The consumer map is `data/mappings/movielens_user_gender_mapping.csv`, with
+`F` mapped to `+1` and `M` to `-1`. Under
+`experiments/runs/movielens/director-gender/run_00/seed_42/`,
+`groups/cpfair_item_director_gender.csv` maps films with at least one woman
+director to `+1` and films directed exclusively by men to `-1`. The
+director-gender partition excludes films with an indeterminate classification
+before splitting and has its own baseline. Each film serves as a provider
+proxy.
+
+#### Amazon consumer activity and brand demand
+
+Place `All_Beauty.json` and `meta_All_Beauty.json` in the
+[Amazon raw data directory](#amazon-all-beauty).
+
+```bash
+uv run python -m experiments.prepare_explicit_method_inputs \
+  --datasets amazon --amazon-brand --allow-missing-demographics --runs 1 --seed 42
+```
+
+In `experiments/runs/amazon/brand/run_00/seed_42/`,
+`groups/cpfair_user_activity.csv` splits the 20% most active consumers in
+training from the remaining consumers. `provider_item_mapping.csv` maps
+products to brands. `groups/provider_group_mapping.csv` assigns groups by each
+brand's total training interactions across its products. By default, the top
+20% of brands, rounded up, form the short head. The remaining brands form
+the protected long tail. Ties are broken by normalized brand name. Each product inherits its
+brand's group in `groups/cpfair_item_brand_popularity.csv`. Products without an
+identifiable brand are excluded before splitting. The brand threshold is set
+with `--item-popularity-top-fraction`. See the [mapping files](data/mappings/README.md#amazon-brands).
+
+To evaluate CPFair with the matching baseline, pass the brand run directory
+explicitly.
+
+```bash
+uv run python -m experiments.RQ3_groups --dataset amazon --method cpfair --k 10 \
+  --run-dir experiments/runs/amazon/brand/run_00/seed_42
+```
+
+#### Yelp consumer activity and census-tract poverty
+
+Place the Yelp reviews in the [Yelp raw data directory](#yelp-open-dataset).
+To build the census mapping when a saved copy is unavailable, add the business data and
+auxiliary files listed in the [census poverty mapping instructions](data/mappings/README.md#yelp-census-poverty-mapping)
+and install the geographic dependencies with `uv sync --extra geographic`.
+
+```bash
+uv run python -m experiments.prepare_explicit_method_inputs \
+  --datasets yelp --yelp-partition cpfair-territorial \
+  --runs 1 --seed 42 --max-users 3500 --max-items 3500
+```
+
+Under `experiments/runs/yelp/cpfair-territorial/run_00/seed_42/`,
+`groups/yelp_item_poverty.csv` maps US businesses with known ACS 2015–2019
+census-tract poverty rates to `+1` for rates of at least 20% and `-1` for
+lower rates. Each business serves as its own provider. The exported
+`groups/cpfair_user_activity.csv` uses a median-based split. At runtime,
+CPFair computes consumer groups from the training matrix using the 20% most
+active users and the remaining users.
+
+### Yelp metropolitan partition for TFLD-Groups
+
+The metropolitan partition uses the 11 regions in the
+[metropolitan mapping instructions](data/mappings/README.md#yelp-metropolitan-areas),
+including Edmonton. Install the geographic dependencies with
+`uv sync --extra geographic` to build the mapping when a saved copy is
+unavailable.
+
+```bash
+uv run python -m experiments.prepare_explicit_method_inputs --datasets yelp \
+  --yelp-partition tfld-metro --runs 1 --allow-missing-demographics
+```
+
+Runs are stored under `experiments/runs/yelp/tfld-metro/`. TFLD-Groups reads
+`groups/yelp_item_metro.csv`. Yelp uses a separate baseline and eligible
+population for each partition. Evaluate each method with the RQ3 entry point.
+
+```bash
+uv run python -m experiments.RQ3_groups --dataset yelp --method cpfair --k 10
+uv run python -m experiments.RQ3_groups --dataset yelp --method tfld-groups --k 10
+```
+
+The RQ3 `group_comparison.tsv` reports per-group provider exposure totals and
+means, and consumer NDCG for all, more-active and less-active users. The two
+Yelp partitions have different populations; do not directly compare them as
+if they were paired runs. Metro preparation requires all 11 groups after filtering.
+The default `--k` in RQ3 is 150, so pass an appropriate value explicitly.
+
+These commands apply to `experiments.RQ3_groups`. The main
+`experiments.grouped_experiments` entry point does not automatically discover
+the nested Yelp partition directories, and its default `GROUPS` configuration
+does not include TFLD-Groups. Its generic CPFair group loader also retains
+fallback paths. Do not assume that running the main entry point automatically
+executes both Yelp partitions; it needs further integration for that workflow.
+
+The local CPFair re-scores the full eligible catalog, whereas the paper describes
+reranking a baseline top-N candidate list; where it uses activity-based user
+groups, its split is top 20%, while the paper's experimental split is top 5%.
+MovieLens and AMBAR instead use gender-based consumer groups. The local greedy
+implementation also uses candidate relevance as its consumer term and binary
+item exposure as its producer term; the paper describes NDCG measured on
+training data as its consumer metric. These choices should be disclosed rather
+than presented as an exact reproduction. The Yelp adapter masks ineligible
+items for both baseline and fair rankings; it does not change the CPFair function.
 
 See every option and its default value with:
 
@@ -266,12 +388,11 @@ With no filters, the main module discovers every directory matching `experiments
 uv run python -m experiments.grouped_experiments
 ```
 
-Dataset filters use the singular, repeatable `--dataset` argument. For example, run only the prepared MovieLens and Yelp data and recompute top-50 baselines from their score matrices:
+Dataset filters use the singular, repeatable `--dataset` argument. For example, run only the prepared MovieLens data and recompute top-50 baselines from its score matrices:
 
 ```bash
 uv run python -m experiments.grouped_experiments \
   --dataset movielens \
-  --dataset yelp \
   --recommendation-list-size 50 \
   --device cpu
 ```
@@ -289,19 +410,15 @@ To run specific prepared directories instead of discovering all runs, repeat `--
 ```bash
 uv run python -m experiments.grouped_experiments \
   --run-dir experiments/runs/movielens/run_00/seed_42 \
-  --run-dir experiments/runs/yelp/run_00/seed_42 \
   --results-root results/selected_runs \
   --recommendation-list-size 50
 ```
 
-When preprocessing artifacts are stored elsewhere, point the runner to the same root:
+To store MovieLens runs elsewhere, add `--output-root artifacts/runs` to both
+[MovieLens preparation commands](#movielens-consumer-and-director-gender).
+Point the runner to the same root.
 
 ```bash
-uv run python -m experiments.prepare_explicit_method_inputs \
-  --datasets movielens yelp \
-  --runs 1 \
-  --output-root artifacts/runs
-
 uv run python -m experiments.grouped_experiments \
   --runs-root artifacts/runs \
   --results-root artifacts/results

@@ -37,3 +37,6 @@ dependencies = [
 
 [tool.uv.extra-build-dependencies]
     torch-scatter = ["torch"]
+
+[project.optional-dependencies]
+geographic = ["geopandas>=1.0,<2"]
