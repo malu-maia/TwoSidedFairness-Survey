@@ -205,7 +205,7 @@ def _read_numeric_matrix(
 ) -> torch.Tensor:
     frame = _read_table(path)
     try:
-        values = frame.to_numpy(dtype=np.float64)
+        values = frame.to_numpy(dtype=np.float64, copy=True)
     except (TypeError, ValueError) as error:
         raise ValueError(f"{path} must contain only numeric values") from error
     if values.ndim != 2 or values.size == 0:
@@ -877,8 +877,8 @@ def _provider_values_from_item_values(
     )
     grouped = frame.groupby("provider_id", sort=True)["value"].sum()
     return (
-        torch.as_tensor(grouped.index.to_numpy(), dtype=torch.long),
-        torch.as_tensor(grouped.to_numpy(), dtype=torch.float64),
+        torch.as_tensor(grouped.index.to_numpy(copy=True), dtype=torch.long),
+        torch.as_tensor(grouped.to_numpy(copy=True), dtype=torch.float64),
     )
 
 
@@ -901,7 +901,7 @@ def _grouped_values(
         aggregated = grouped.sum()
     else:
         raise ValueError(f"unsupported aggregation: {aggregation}")
-    return torch.as_tensor(aggregated.to_numpy(), dtype=torch.float64)
+    return torch.as_tensor(aggregated.to_numpy(copy=True), dtype=torch.float64)
 
 
 def _grouped_values_and_merit(
@@ -918,8 +918,8 @@ def _grouped_values_and_merit(
     )
     grouped = frame.groupby("group", sort=True)[["value", "merit"]].sum()
     return (
-        torch.as_tensor(grouped["value"].to_numpy(), dtype=torch.float64),
-        torch.as_tensor(grouped["merit"].to_numpy(), dtype=torch.float64),
+        torch.as_tensor(grouped["value"].to_numpy(copy=True), dtype=torch.float64),
+        torch.as_tensor(grouped["merit"].to_numpy(copy=True), dtype=torch.float64),
     )
 
 
