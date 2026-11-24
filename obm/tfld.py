@@ -1,7 +1,6 @@
 import torch
-import torch.nn.functional as F
 
-from obm._welfare import get_b, get_u, get_v
+from obm._welfare import get_b, policy_utilities, ranking_distribution
 
 NAME = 'Lorenz'
 
@@ -58,11 +57,17 @@ def tfld(
     device: torch.device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     ),
+    *,
+    exposure_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
   """Run the two-sided Lorenz-dominance optimization.
 
+  With ``exposure_only``, track the float32 expected-exposure matrix directly.
+  The Frank–Wolfe update is linear in exposure and the objective needs only
+  exposure, so this avoids storing the full user-by-item-by-rank policy.
+
   Returns:
-      Fair scores, stochastic ranking policy, user utilities, and item
+      Fair scores, stochastic ranking policy (or expected exposure), user utilities, and item
       utilities. No data files are read by this function.
   """
   if scores.ndim != 2:
@@ -93,12 +98,8 @@ def tfld(
   # Start with a deterministic ranking where each user gets the items they have the highest score for.
   _, sorted_indices = torch.sort(S, descending=True, dim=1)
   top_k_indices = sorted_indices[:, :k]
-  # P_stochastic is the probability tensor. Initially, it's deterministic (0 or 1).
-  P_stochastic = (
-      F.one_hot(top_k_indices, num_classes=M)
-      .permute(0, 2, 1)
-      .to(torch.float16)
-      .to(device)
+  distribution = ranking_distribution(
+      top_k_indices, M, v_exposure_weights, exposure_only=exposure_only
   )
 
   welfare_store_vector = []
@@ -106,8 +107,7 @@ def tfld(
   # Frank-Wolfe
   for t in range(epochs):
       # Current user and item utilities
-      user_utilities = get_u(S, P_stochastic, v_exposure_weights).to(device)
-      item_utilities = get_v(P_stochastic, v_exposure_weights).to(device)
+      user_utilities, item_utilities = policy_utilities(S, distribution, v_exposure_weights)
 
       # Gradient components
       phi_prime_u = phi_prime(user_utilities, alpha_1, eta) # Shape: (N,)
@@ -123,16 +123,13 @@ def tfld(
       # Finding the next ranking direction P_tilde by sorting based on scores A
       _, sorted_indices_tilde = torch.sort(A, descending=True, dim=1)
       top_k_indices_tilde = sorted_indices_tilde[:, :k]
-      P_tilde = (
-          F.one_hot(top_k_indices_tilde, num_classes=M)
-          .permute(0, 2, 1)
-          .to(torch.float16)
-          .to(device)
+      direction = ranking_distribution(
+          top_k_indices_tilde, M, v_exposure_weights, exposure_only=exposure_only
       )
 
       # Updating the stochastic ranking tensor P
       gamma = 2 / (t + 2) # Step size
-      P_stochastic = (1 - gamma) * P_stochastic + gamma * P_tilde
+      distribution = (1 - gamma) * distribution + gamma * direction
 
       if (t + 1) % 100 == 0:
         total_welfare = compute_welfare(user_utilities, item_utilities, lamb=lamb, alpha_1=alpha_1, alpha_2=alpha_2, eta=eta)
@@ -142,7 +139,7 @@ def tfld(
   print("-" * 30)
   print("Optimization finished.")
 
-  return A, P_stochastic, user_utilities, item_utilities
+  return A, distribution, user_utilities, item_utilities
 
 
 def train(

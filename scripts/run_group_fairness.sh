@@ -25,6 +25,7 @@ device=${DEVICE:-cpu}
 tfld_epochs=${TFLD_EPOCHS:-200}
 runs_root=${RUNS_ROOT:-experiments/runs/group_fairness}
 results_root=${RESULTS_ROOT:-results_11}
+best_hyperparams=${BEST_HYPERPARAMS:-}
 
 if [[ ! $run_count =~ ^[1-9][0-9]*$ || ! $base_seed =~ ^(0|[1-9][0-9]*)$ ]]; then
   printf 'RUNS must be a positive integer and SEED a nonnegative integer.\n' >&2
@@ -43,6 +44,11 @@ fi
 
 if ! command -v "$python" >/dev/null; then
   printf 'Python executable not found: %s\n' "$python" >&2
+  exit 2
+fi
+
+if [[ $mode != prepare && -n $best_hyperparams && ! -f $best_hyperparams ]]; then
+  printf 'Best hyperparameter file not found: %s\n' "$best_hyperparams" >&2
   exit 2
 fi
 
@@ -83,6 +89,10 @@ printf 'Writing results to %s\n' "$result_dir"
 
 common=(--device "$device" --tfld-epochs "$tfld_epochs"
         --yelp-tfld-partition cpfair-territorial "${run_dirs[@]}")
+if [[ -n $best_hyperparams ]]; then
+  cp -- "$best_hyperparams" "$result_dir/best_hyperparams.json"
+  common+=(--best-hyperparams "$result_dir/best_hyperparams.json")
+fi
 for k in "${k_values[@]}"; do
   printf 'Running %s with k=%s\n' "$runner" "$k"
   k_results="$result_dir/k_$k"

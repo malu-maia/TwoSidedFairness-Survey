@@ -1,0 +1,279 @@
+{
+  "format_version": 1,
+  "k": 150,
+  "validation_seeds": [
+    42,
+    43,
+    44
+  ],
+  "selection": {
+    "source": "results/hyperparameter_sensitivity/k_150/validation_metrics.tsv",
+    "criterion": "For each dataset and method, maximize the smaller of the two median validation fairness gains. Break ties by mean validation NDCG, then setting ID, among nondominated configurations.",
+    "scope": "Configurations tested on random subsets of the survey data."
+  },
+  "datasets": {
+    "amazon": {
+      "RQ3": {
+        "CPFair": "l1_0.9_l2_0.03",
+        "TFLD-Groups": "lamb_0.01_alpha_0"
+      },
+      "RQ4": {
+        "Ada2Fair": "alpha_0.3",
+        "CPFair": "l1_0.05_l2_0.05",
+        "FairSort": "uniform_0.1_floor_0.95",
+        "GGF": "task2_lamb_0.25_omega_0.5",
+        "TFLD": "lamb_0.01_alpha_0",
+        "TFROM": "uniform"
+      },
+      "exploratory": {
+        "FairRec": "full_mms",
+        "LeadFairRec": "gamma_-256_delta_16",
+        "SEAL": "min_0.5_max_users"
+      }
+    },
+    "ambar": {
+      "RQ3": {
+        "CPFair": "l1_0.9_l2_0.03",
+        "TFLD-Groups": "lamb_0.01_alpha_0"
+      },
+      "RQ4": {
+        "Ada2Fair": "alpha_1",
+        "CPFair": "l1_0.05_l2_0.05",
+        "FairSort": "uniform_0.2_floor_0.9",
+        "GGF": "task1_lamb_0.5",
+        "TFLD": "lamb_0.05_alpha_0",
+        "TFROM": "uniform"
+      },
+      "exploratory": {
+        "FairRec": "full_mms",
+        "LeadFairRec": "gamma_-256_delta_16",
+        "SEAL": "min_0.5_max_users"
+      }
+    },
+    "movielens": {
+      "RQ3": {
+        "CPFair": "l1_0.9_l2_0.03",
+        "TFLD-Groups": "lamb_0.01_alpha_0"
+      },
+      "RQ4": {
+        "Ada2Fair": "alpha_1",
+        "CPFair": "l1_0.05_l2_0.05",
+        "FairSort": "uniform_1_floor_0.95",
+        "GGF": "task2_lamb_0.1_omega_1",
+        "TFLD": "lamb_0.01_alpha_0",
+        "TFROM": "uniform"
+      },
+      "exploratory": {
+        "FairRec": "full_mms",
+        "LeadFairRec": "gamma_-256_delta_16",
+        "SEAL": "min_0.5_max_users"
+      }
+    },
+    "yelp": {
+      "RQ3": {
+        "CPFair": "l1_0.9_l2_0.03",
+        "TFLD-Groups": "lamb_0.01_alpha_0"
+      },
+      "RQ4": {
+        "Ada2Fair": "alpha_0.75",
+        "CPFair": "l1_0.9_l2_0.03",
+        "FairSort": "quality_1_floor_0.95",
+        "GGF": "task1_lamb_0.5",
+        "TFLD": "lamb_0.15_alpha_0",
+        "TFROM": "uniform"
+      },
+      "exploratory": {
+        "FairRec": "full_mms",
+        "LeadFairRec": "gamma_-256_delta_16",
+        "SEAL": "min_0.5_max_users"
+      }
+    }
+  },
+  "parameters": {
+    "Ada2Fair": {
+      "alpha_0.3": {
+        "alpha": 0.3,
+        "epochs": 20,
+        "weight_epochs": 5,
+        "embedding_dim": 64,
+        "generator_hidden_dim": 32,
+        "adapter_hidden_dim": 16,
+        "batch_size": 4096,
+        "learning_rate": 0.001,
+        "provider_eta": 2.0,
+        "user_eta": 1.0,
+        "delta": 1e-07,
+        "weight_topk": 100,
+        "exclude_seen": true
+      },
+      "alpha_0.75": {
+        "alpha": 0.75,
+        "epochs": 20,
+        "weight_epochs": 5,
+        "embedding_dim": 64,
+        "generator_hidden_dim": 32,
+        "adapter_hidden_dim": 16,
+        "batch_size": 4096,
+        "learning_rate": 0.001,
+        "provider_eta": 2.0,
+        "user_eta": 1.0,
+        "delta": 1e-07,
+        "weight_topk": 100,
+        "exclude_seen": true
+      },
+      "alpha_1": {
+        "alpha": 1.0,
+        "epochs": 20,
+        "weight_epochs": 5,
+        "embedding_dim": 64,
+        "generator_hidden_dim": 32,
+        "adapter_hidden_dim": 16,
+        "batch_size": 4096,
+        "learning_rate": 0.001,
+        "provider_eta": 2.0,
+        "user_eta": 1.0,
+        "delta": 1e-07,
+        "weight_topk": 100,
+        "exclude_seen": true
+      }
+    },
+    "CPFair": {
+      "l1_0.05_l2_0.05": {
+        "lambda1": 0.05,
+        "lambda2": 0.05
+      },
+      "l1_0.9_l2_0.03": {
+        "lambda1": 0.9,
+        "lambda2": 0.03
+      }
+    },
+    "FairRec": {
+      "full_mms": {
+        "mms_fraction": 1.0
+      }
+    },
+    "FairSort": {
+      "quality_1_floor_0.95": {
+        "fairness": "quality",
+        "rerank_ratio": 1.0,
+        "ndcg_floor": 0.95,
+        "lambda_max": 8.0,
+        "search_gap": 0.03125,
+        "user_order": "input"
+      },
+      "uniform_0.1_floor_0.95": {
+        "fairness": "uniform",
+        "rerank_ratio": 0.1,
+        "ndcg_floor": 0.95,
+        "lambda_max": 8.0,
+        "search_gap": 0.03125,
+        "user_order": "input"
+      },
+      "uniform_0.2_floor_0.9": {
+        "fairness": "uniform",
+        "rerank_ratio": 0.2,
+        "ndcg_floor": 0.9,
+        "lambda_max": 8.0,
+        "search_gap": 0.03125,
+        "user_order": "input"
+      },
+      "uniform_1_floor_0.95": {
+        "fairness": "uniform",
+        "rerank_ratio": 1.0,
+        "ndcg_floor": 0.95,
+        "lambda_max": 8.0,
+        "search_gap": 0.03125,
+        "user_order": "input"
+      }
+    },
+    "GGF": {
+      "task1_lamb_0.5": {
+        "task": 1,
+        "lamb": 0.5,
+        "q": null,
+        "omega": null,
+        "beta": null,
+        "epochs": 200
+      },
+      "task2_lamb_0.1_omega_1": {
+        "task": 2,
+        "lamb": 0.1,
+        "q": 0.25,
+        "omega": 1.0,
+        "beta": null,
+        "epochs": 200
+      },
+      "task2_lamb_0.25_omega_0.5": {
+        "task": 2,
+        "lamb": 0.25,
+        "q": 0.25,
+        "omega": 0.5,
+        "beta": null,
+        "epochs": 200
+      }
+    },
+    "LeadFairRec": {
+      "gamma_-256_delta_16": {
+        "gamma": -256,
+        "delta": 16,
+        "beta": 1,
+        "similar_user_count": 30,
+        "semantic_weight": 0.15,
+        "profile_embedding_dim": 64,
+        "profile_source": "local_fallback",
+        "exclude_seen": true
+      }
+    },
+    "SEAL": {
+      "min_0.5_max_users": {
+        "fraction": 0.5,
+        "upper": "users"
+      }
+    },
+    "TFLD": {
+      "lamb_0.01_alpha_0": {
+        "lamb": 0.01,
+        "alpha": [
+          0.0,
+          0.0
+        ],
+        "epochs": 200,
+        "eta": 1e-09
+      },
+      "lamb_0.05_alpha_0": {
+        "lamb": 0.05,
+        "alpha": [
+          0.0,
+          0.0
+        ],
+        "epochs": 200,
+        "eta": 1e-09
+      },
+      "lamb_0.15_alpha_0": {
+        "lamb": 0.15,
+        "alpha": [
+          0.0,
+          0.0
+        ],
+        "epochs": 200,
+        "eta": 1e-09
+      }
+    },
+    "TFLD-Groups": {
+      "lamb_0.01_alpha_0": {
+        "lamb": 0.01,
+        "alpha": [
+          0.0,
+          0.0
+        ],
+        "epochs": 200,
+        "eta": 1e-09
+      }
+    },
+    "TFROM": {
+      "uniform": {
+        "fairness": "offline_uniform"
+      }
+    }
+  }
+}

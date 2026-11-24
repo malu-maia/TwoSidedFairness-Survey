@@ -2,11 +2,10 @@ import math
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from scipy.optimize import isotonic_regression
 
-from obm._welfare import get_b, get_u, get_v
+from obm._welfare import get_b, policy_utilities, ranking_distribution
 
 NAME='Gini'
 
@@ -106,6 +105,8 @@ def ggf(
     device: torch.device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     ),
+    *,
+    exposure_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Run the Generalized Gini fairness optimization on a score matrix.
 
@@ -119,8 +120,11 @@ def ggf(
     weights; with a constant w^1 the user-side projection is beta-invariant,
     but nothing else is.
 
+    With ``exposure_only``, perform the same Frank–Wolfe updates on the
+    float32 expected-exposure matrix and return it in place of the policy.
+
     Returns:
-        Fair scores, stochastic ranking policy, user utilities, and item
+        Fair scores, stochastic ranking policy (or expected exposure), user utilities, and item
         utilities. No data files are read by this function.
     """
     if scores.ndim != 2:
@@ -151,11 +155,9 @@ def ggf(
 
     _, sorted_indices = torch.sort(scores, descending=True, dim=1)
     top_k_indices = sorted_indices[:, :resolved_k]
-    P_stochastic = (
-        F.one_hot(top_k_indices, num_classes=m)
-        .permute(0, 2, 1)
-        .to(torch.float16)
-        .to(device)
+    b = get_b(resolved_k).to(device)
+    distribution = ranking_distribution(
+        top_k_indices, m, b, exposure_only=exposure_only
     )
     
     w1 = (torch.ones(n) if user_weights is None else user_weights).to(device)
@@ -164,14 +166,11 @@ def ggf(
     beta_0 = prop5_beta(n, resolved_k, w1, w2, lamb) if beta is None else float(beta)
     beta_0 = torch.tensor(beta_0).to(device)
 
-    b = get_b(resolved_k).to(device)
-
     losses = []
 
     for t in range(1, epochs+1):
         beta_t = beta_0 / np.sqrt(t)
-        u = get_u(scores, P_stochastic, b).to(device)
-        v = get_v(P_stochastic, b).to(device)
+        u, v = policy_utilities(scores, distribution, b)
         y1 = projection(u/beta_t, w1, device).to(device)
         y2 = projection(v/beta_t, w2, device).to(device)
 
@@ -181,13 +180,9 @@ def ggf(
         _, sorted_indices = torch.sort(scores_tilde, descending=True, dim=1)
         top_k_indices = sorted_indices[:, :resolved_k]
     
-        Q_t = (
-            F.one_hot(top_k_indices, num_classes=m)
-            .permute(0, 2, 1)
-            .to(torch.float16)
-            .to(device)
-        )
-        P_stochastic = (1 - (2/(t+2))) * P_stochastic + (2/(t+2)) * Q_t
+        direction = ranking_distribution(top_k_indices, m, b, exposure_only=exposure_only)
+        gamma = 2 / (t + 2)
+        distribution = (1 - gamma) * distribution + gamma * direction
 
         loss = loss_function(u, v, w1, w2, lamb)
         losses.append(-loss)
@@ -195,7 +190,7 @@ def ggf(
         if (t+1)%100==0:
             print(f'Epoch {t+1}/{epochs}: Loss {-loss}')
 
-    return scores_tilde, P_stochastic, u, v
+    return scores_tilde, distribution, u, v
 
 
 def train(

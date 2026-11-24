@@ -857,6 +857,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Frank-Wolfe iterations used by TFLD-Groups (default: 200).",
     )
     parser.add_argument(
+        "--best-hyperparams", type=Path,
+        help="JSON file with dataset-specific RQ3 settings for CPFair and TFLD-Groups.",
+    )
+    parser.add_argument(
         "--yelp-tfld-partition",
         choices=experiment_pipeline.YELP_ITEM_GROUP_FILES,
         default="tfld-metro",
@@ -901,12 +905,21 @@ def main(argv: Sequence[str] | None = None) -> int:
     selected_datasets = list(dict.fromkeys(args.dataset or ("ambar",)))
     selected_dataset_set = set(selected_datasets)
     selected_methods = list(dict.fromkeys(args.method or ("cpfair",)))
+    best_hyperparams = None
+    if args.best_hyperparams is not None:
+        try:
+            best_hyperparams = experiment_pipeline.load_best_group_hyperparams(
+                args.best_hyperparams, cpfair_suite="RQ3"
+            )
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
     config = experiment_pipeline.RunnerConfig(
         device=args.device,
         tfld_epochs=args.tfld_epochs,
         yelp_tfld_partition=args.yelp_tfld_partition,
         tfld_alpha=tuple(args.tfld_alpha),
         tfld_lambda=args.tfld_lambda,
+        best_hyperparams=best_hyperparams,
     )
     try:
         directories = (

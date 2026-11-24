@@ -58,7 +58,7 @@ RESULT_FIELDS = [
 
 @dataclass(frozen=True)
 class RunnerConfig:
-    """Execution parameters for expensive methods."""
+    """Execution parameters for fairness methods."""
 
     ada2fair_epochs: int = 20
     ada2fair_weight_epochs: int = 5
@@ -78,6 +78,15 @@ class RunnerConfig:
     multifr_positive_threshold: float = 0.8
     device: str = "cpu"
     yelp_tfld_partition: str = "tfld-metro"
+    best_hyperparams: Mapping[str, Mapping[str, dict]] | None = None
+
+    def hyperparams_for(self, dataset: str, method: str) -> dict:
+        if self.best_hyperparams is None:
+            return {}
+        try:
+            return self.best_hyperparams[dataset.lower()][method]
+        except KeyError as error:
+            raise ValueError(f"No selected hyperparameters for {method} on {dataset}") from error
 
 
 @dataclass(frozen=True)
@@ -155,6 +164,27 @@ def _resolve(path: str | Path) -> Path:
     if resolved.is_absolute():
         return resolved
     return PROJECT_ROOT / resolved
+
+
+def load_best_group_hyperparams(path: str | Path, *, cpfair_suite: str) -> dict[str, dict[str, dict]]:
+    """Read the selected CPFair and TFLD-Groups parameters for each dataset."""
+    source = _resolve(path)
+    data = json.loads(source.read_text(encoding="utf-8"))
+    try:
+        selections = {
+            dataset: {
+                method: data["parameters"][method][suites[suite][method]]
+                for method, suite in (("CPFair", cpfair_suite), ("TFLD-Groups", "RQ3"))
+            }
+            for dataset, suites in data["datasets"].items()
+        }
+    except (AttributeError, KeyError, TypeError) as error:
+        raise ValueError(f"{source} has invalid or incomplete group method selections: {error}") from error
+    for dataset, methods in selections.items():
+        for method, parameters in methods.items():
+            if not isinstance(parameters, dict) or not parameters:
+                raise ValueError(f"{source} has invalid parameters for {method} on {dataset}")
+    return selections
 
 
 def _read_table(path: Path) -> pd.DataFrame:
@@ -1108,6 +1138,7 @@ def _run_cpfair(run: PreparedRun, config: RunnerConfig) -> MethodOutput:
         base_topk=run.base_topk.detach().cpu().numpy(),
         k=run.k,
         device=config.device,
+        **config.hyperparams_for(run.dataset, "CPFair"),
     )
     return _as_output(scores, topk, run.k)
 
@@ -1197,16 +1228,19 @@ def _run_tfld_groups(run: PreparedRun, config: RunnerConfig) -> MethodOutput:
     from obm.tfld_groups import tfld_groups
 
     user_groups, item_groups = _tfld_group_vectors(run, config)
+    hyperparams = {
+        "epochs": config.tfld_epochs,
+        "alpha": config.tfld_alpha,
+        "lamb": config.tfld_lambda,
+    } | config.hyperparams_for(run.dataset, "TFLD-Groups")
     exposure, topk, _, _ = tfld_groups(
         run.scores.clone(),
         user_groups=user_groups,
         item_groups=item_groups,
-        epochs=config.tfld_epochs,
         k=run.k,
-        alpha=config.tfld_alpha,
-        lamb=config.tfld_lambda,
         device=torch.device(config.device),
         eligible_items=run.eligible_items if run.dataset.lower() == "yelp" else None,
+        **hyperparams,
     )
     return _as_output(exposure, topk, run.k)
 
@@ -1540,6 +1574,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--ggf-epochs", type=_positive_int, default=200)
     parser.add_argument("--tfld-epochs", type=_positive_int, default=200)
     parser.add_argument(
+        "--best-hyperparams", type=Path,
+        help="JSON file with dataset-specific RQ4 CPFair and RQ3 TFLD-Groups settings.",
+    )
+    parser.add_argument(
         "--include-tfld-groups", action="store_true",
         help="Add TFLD-Groups to active CPFair comparisons 02 and 08.",
     )
@@ -1552,6 +1590,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--multifr-positive-threshold", type=float, default=0.8)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args(argv)
+    best_hyperparams = None
+    if args.best_hyperparams is not None:
+        try:
+            best_hyperparams = load_best_group_hyperparams(args.best_hyperparams, cpfair_suite="RQ4")
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
 
     if (
         not math.isfinite(args.worse_off_fraction)
@@ -1609,6 +1653,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             worse_off_fraction=args.worse_off_fraction,
             multifr_positive_threshold=args.multifr_positive_threshold,
             device=args.device,
+            best_hyperparams=best_hyperparams,
         ),
     )
     for path in paths:
