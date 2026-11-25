@@ -173,19 +173,28 @@ def load_best_group_hyperparams(path: str | Path, *, cpfair_suite: str) -> dict[
 
 
 def load_hyperparameter_config(
-    path: str | Path, *, cpfair_suite: str,
+    path: str | Path, *, cpfair_suite: str, requested_k: int | None = None,
 ) -> tuple[dict[str, dict[str, dict]], int | None]:
     """Read a frozen configuration, or the legacy group-only settings."""
     source = _resolve(path)
     data = json.loads(source.read_text(encoding="utf-8"))
     try:
-        if data.get("format_version") == 2:
+        version = data.get("format_version")
+        if version in (2, 3):
             k = data["k"]
             if type(k) is not int or k < 1:
                 raise ValueError(f"{source} has an invalid shared cutoff")
+            if version == 3:
+                k = k if requested_k is None else requested_k
+                by_cutoff = data["settings_by_cutoff"]
+                if str(k) not in by_cutoff:
+                    raise ValueError(f"{source} has no settings for k={k}")
+                datasets = by_cutoff[str(k)]
+            else:
+                datasets = data["datasets"]
             expected = {method for group in GROUPS for method in group.methods} | {"TFLD-Groups"}
             selected = {}
-            for dataset, methods in data["datasets"].items():
+            for dataset, methods in datasets.items():
                 if set(methods) != expected:
                     raise ValueError(f"{source} has incomplete frozen methods for {dataset}")
                 selected[dataset] = {method: entry["parameters"] for method, entry in methods.items()}
@@ -1645,7 +1654,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     frozen_k = None
     if args.best_hyperparams is not None:
         try:
-            best_hyperparams, frozen_k = load_hyperparameter_config(args.best_hyperparams, cpfair_suite="RQ4")
+            best_hyperparams, frozen_k = load_hyperparameter_config(
+                args.best_hyperparams, cpfair_suite="RQ4", requested_k=args.recommendation_list_size,
+            )
         except (OSError, ValueError) as error:
             parser.error(str(error))
 

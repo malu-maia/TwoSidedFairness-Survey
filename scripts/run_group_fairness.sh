@@ -39,20 +39,45 @@ fi
 
 if [[ $mode != prepare && -n $best_hyperparams && ! -f $best_hyperparams ]]; then
   printf 'Best hyperparameter file not found: %s\n' "$best_hyperparams" >&2
+  printf 'Generate it with: uv run python -m experiments.shared_cutoff_sensitivity --phase validation\n' >&2
   exit 2
 fi
 
-frozen_k=
-if [[ -n $best_hyperparams && -f $best_hyperparams ]]; then
-  frozen_k=$("$python" -c 'import json,sys; data=json.load(open(sys.argv[1])); print(data["k"] if data.get("format_version")==2 else "")' "$best_hyperparams")
+if [[ -n ${K:-} && ! $K =~ ^[1-9][0-9]*$ ]]; then
+  printf 'K must be a positive integer.\n' >&2
+  exit 2
 fi
-chosen_k=${K:-$frozen_k}
-if [[ -n $chosen_k ]]; then
-  if [[ ! $chosen_k =~ ^[1-9][0-9]*$ ]]; then
-    printf 'K must be a positive integer.\n' >&2
-    exit 2
-  fi
-  k_values=("$chosen_k")
+
+frozen_cutoffs=
+if [[ -n $best_hyperparams && -f $best_hyperparams ]]; then
+  frozen_cutoffs=$("$python" - "$best_hyperparams" "$runner" "${K:-}" <<'PY'
+import json
+import sys
+
+source, runner, requested_k = sys.argv[1:]
+with open(source, encoding="utf-8") as stream:
+    data = json.load(stream)
+version = data.get("format_version")
+if version in (2, 3):
+    winner = data["k"]
+    if type(winner) is not int or winner < 1:
+        sys.exit(f"{source} has an invalid shared cutoff")
+    if version == 3:
+        available = data["settings_by_cutoff"]
+        for k in (str(winner), requested_k):
+            if k and k not in available:
+                sys.exit(f"{source} has no settings for k={k}")
+    if version == 3 and runner == "grouped_experiments":
+        print(*sorted(map(int, available)))
+    else:
+        print(winner)
+PY
+)
+fi
+if [[ -n ${K:-} ]]; then
+  k_values=("$K")
+elif [[ -n $frozen_cutoffs ]]; then
+  read -r -a k_values <<< "$frozen_cutoffs"
 elif [[ $runner == rq3 ]]; then
   k_values=(150)
 fi
@@ -122,8 +147,9 @@ printf 'Writing results to %s\n' "$result_dir"
 common=(--device "$device" --tfld-epochs "$tfld_epochs"
         --yelp-tfld-partition cpfair-territorial "${run_dirs[@]}")
 if [[ -n $best_hyperparams ]]; then
-  cp -- "$best_hyperparams" "$result_dir/best_hyperparams.json"
-  common+=(--best-hyperparams "$result_dir/best_hyperparams.json")
+  config_copy="$result_dir/${best_hyperparams##*/}"
+  cp -- "$best_hyperparams" "$config_copy"
+  common+=(--best-hyperparams "$config_copy")
 fi
 for k in "${k_values[@]}"; do
   printf 'Running %s with k=%s\n' "$runner" "$k"

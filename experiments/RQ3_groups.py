@@ -912,7 +912,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.best_hyperparams is not None:
         try:
             best_hyperparams, frozen_k = experiment_pipeline.load_hyperparameter_config(
-                args.best_hyperparams, cpfair_suite="RQ3"
+                args.best_hyperparams, cpfair_suite="RQ3", requested_k=args.k,
             )
         except (OSError, ValueError) as error:
             parser.error(str(error))
