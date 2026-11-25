@@ -22,7 +22,7 @@ maximizer is ``(S, C)``-Lorenz efficient.
 
 import torch
 
-from obm._welfare import get_b
+from obm._welfare import get_b, update_exposure
 from obm.tfld import psi, psi_prime
 
 NAME = "Lorenz-Groups"
@@ -166,15 +166,12 @@ def tfld_groups(
         term_item = lamb * psi_prime(item_group_utils, alpha_2, eta)[
             item_index
         ].unsqueeze(0)
-        A = term_user + term_item
+        A = term_user.add_(term_item)
 
         # Frank-Wolfe direction: the top-k of A per user (Theorem 1).
-        E_tilde = _exposure_from_topk(
-            torch.topk(A.masked_fill(~eligible, -torch.inf), k, dim=1).indices, M, v_exposure_weights
-        )
-
+        direction = A.masked_fill_(~eligible, -torch.inf).topk(k, dim=1).indices
         gamma = 2 / (t + 2)  # Step size
-        E = (1 - gamma) * E + gamma * E_tilde
+        update_exposure(E, direction, v_exposure_weights, gamma)
 
         if (t + 1) % 100 == 0:
             total_welfare = group_welfare(

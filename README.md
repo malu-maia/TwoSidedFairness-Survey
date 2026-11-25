@@ -259,8 +259,11 @@ uv run python -m experiments.prepare_explicit_method_inputs \
 
 Download MovieLens 1M and generate `Movie Lens/auxiliary_data/director_gender.csv`
 using the [director mapping instructions](data/mappings/README.md#movielens-directors).
-The grouped runner pairs the standard run with the director-gender run. Keep
-the run count, seed, and preprocessing limits the same in both commands.
+The grouped runner uses the director-gender MovieLens run for CPFair and
+TFLD-Groups and the matching standard run for the other enabled methods. Each method
+uses the baseline for its input. Pair the two runs by using the same output
+root, run count, seed, and preprocessing limits in both commands. RQ3 uses
+the director-gender run directly.
 
 ```bash
 uv run python -m experiments.prepare_explicit_method_inputs \
@@ -381,6 +384,92 @@ uv run python -m experiments.prepare_explicit_method_inputs --help
 ```
 
 ## 2. Run the grouped experiments
+
+### Tune the study methods at each cutoff and select a shared cutoff
+
+From the repository root, run:
+
+```bash
+uv run python -m experiments.shared_cutoff_sensitivity --workers 8
+```
+
+The runner uses one coordinated split per dataset. For each variant and fitting
+seed, it trains BPR for 200 epochs and uses validation NDCG to select a separate
+checkpoint at each cutoff (10, 25, 50, 100, and 150). It evaluates the full
+method grid on all users eligible at every cutoff. It selects each method's
+settings using the smaller of its two median paired fairness gains, subject to
+valid rankings on all three seeds and a median paired NDCG margin of at least
+zero against 95% of matched BPR NDCG.
+
+Every pair whose selected setting meets those requirements and improves both
+fairness measures votes for its cutoff. Ties favor the shorter list. RQ2 uses
+the frozen checkpoint and fairness settings for each cutoff. Fixed, reference,
+and other fallback settings are identified in the results. SEAL uses a
+zero-minimum fallback only when no tested positive minimum yields valid
+rankings on all seeds. Failed allocations and quota violations remain in the
+results with their status.
+
+Inputs are saved under `experiments/runs/shared_cutoff/`. Results are saved
+under `results/hyperparameter_sensitivity/shared_cutoff_per_k/`, including
+`checkpoints.tsv`, `best_hyperparams_by_k.json`, the 40-pair primary table,
+and the 200-pair-by-cutoff RQ2 table. The previous study's artifacts are in
+`results/hyperparameter_sensitivity/shared_cutoff/`. The new frozen file is
+consumed by the per-cutoff study runner, which pairs settings with their
+checkpoint scores.
+
+Use `--phase prepare` on fresh inputs, `--phase benchmark` to time a subset
+on the prepared MovieLens data, `--phase validation` to select settings, and
+`--phase test` to evaluate the frozen selections. Reuse the same roots to
+resume completed jobs. The default run includes the benchmark before the
+full validation sweep.
+
+The grouped runner uses the standard input for eight methods and matches CPFair
+and TFLD-Groups to each run's designated group input. Prepare standard Amazon
+without the brand flag and standard Yelp with `--yelp-partition standard`.
+
+### Shell launchers
+
+`scripts/run_grouped_experiments.sh` runs the grouped comparisons, and
+`scripts/run_rq3.sh` runs the underserved-group analysis. Their
+`*_best_hyperparams.sh` counterparts load the saved dataset-specific settings
+for CPFair and TFLD-Groups. The grouped launcher uses the RQ4 weights for CPFair.
+The RQ3 launcher uses its RQ3 weights. Both use the saved RQ3 setting for
+TFLD-Groups and the census-tract poverty partition for Yelp.
+[Saved settings](experiments/best_hyperparams.json)
+
+These launchers default to the earlier pilot settings. Point `BEST_HYPERPARAMS`
+to the shared-cutoff run's `best_hyperparams.json` to use its frozen settings
+and cutoff.
+
+```bash
+# Prepare the inputs and run the grouped comparisons at k=150.
+DEVICE=cuda K=150 bash scripts/run_group_fairness_best_hyperparams.sh all
+
+# Reuse the prepared group inputs for RQ3.
+DEVICE=cuda bash scripts/run_rq3_best_hyperparams.sh run
+```
+
+Use `prepare` to build inputs, `run` to evaluate prepared inputs, or `all` to do both.
+The launchers default to 10 runs starting at seed 42, with `DEVICE=cpu`
+and `RUNS_ROOT=experiments/runs/group_fairness`. Grouped comparisons default
+to cutoffs of 10, 25, 50, 100, and 150. `K` selects a single grouped cutoff.
+The RQ3 launcher uses `k=150`. The tuned launchers create a fresh output
+directory under `results/best_hyperparams/` and save a copy of the settings
+there. Set `RESULTS_ROOT` to choose a different destination.
+
+The grouped launcher prepares both MovieLens inputs and checks for a
+director-gender run matching each standard run. If you already have the
+director-gender inputs and only standard MovieLens is missing, prepare it
+with the same runs root, seed, and run count. For the default run settings:
+
+```bash
+uv run python -m experiments.prepare_explicit_method_inputs \
+  --datasets movielens --output-root experiments/runs/group_fairness \
+  --runs 10 --seed 42 --recommendation-list-length 150 \
+  --max-users 3500 --max-items 3500 --no-shared-run-zero
+```
+
+### Python entry point
 
 With no filters, the main module discovers every directory matching `experiments/runs/*/run_*/seed_*`:
 

@@ -555,9 +555,12 @@ def discover_dataset_runs(runs_root: str | Path, dataset: str) -> list[Path]:
         path for path in dataset_root.glob("run_*/seed_*") if path.is_dir()
     )
     if normalized_dataset == "yelp":
-        directories = sorted(path for path in dataset_root.glob("*/run_*/seed_*") if path.is_dir())
+        directories = sorted(path for path in dataset_root.glob("*/run_*/seed_*")
+                             if path.is_dir() and path.parent.parent.name != "standard")
     elif normalized_dataset == "movielens":
         directories = sorted(path for path in (dataset_root / "director-gender").glob("run_*/seed_*") if path.is_dir())
+    elif normalized_dataset == "amazon":
+        directories = sorted(path for path in (dataset_root / "brand").glob("run_*/seed_*") if path.is_dir())
     if not directories:
         raise FileNotFoundError(
             f"no prepared {normalized_dataset} runs found under {dataset_root}. "
@@ -569,7 +572,7 @@ def discover_dataset_runs(runs_root: str | Path, dataset: str) -> list[Path]:
 
 
 def _yelp_partition_for_method(method: str, config: experiment_pipeline.RunnerConfig) -> str:
-    return "cpfair-territorial" if method == "cpfair" else config.yelp_tfld_partition
+    return "cpfair-territorial" if method == "cpfair" or config.frozen_settings else config.yelp_tfld_partition
 
 
 def analyze_yelp_run(run: experiment_pipeline.PreparedRun, method: str, config: experiment_pipeline.RunnerConfig, results_root: Path) -> Path:
@@ -886,8 +889,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--k",
         type=_positive_integer,
-        default=150,
-        help="Recommendation-list size (default: 150).",
+        help="Recommendation-list size, defaulting to the frozen cutoff or 150.",
     )
     parser.add_argument(
         "--device",
@@ -906,9 +908,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     selected_dataset_set = set(selected_datasets)
     selected_methods = list(dict.fromkeys(args.method or ("cpfair",)))
     best_hyperparams = None
+    frozen_k = None
     if args.best_hyperparams is not None:
         try:
-            best_hyperparams = experiment_pipeline.load_best_group_hyperparams(
+            best_hyperparams, frozen_k = experiment_pipeline.load_hyperparameter_config(
                 args.best_hyperparams, cpfair_suite="RQ3"
             )
         except (OSError, ValueError) as error:
@@ -920,6 +923,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tfld_alpha=tuple(args.tfld_alpha),
         tfld_lambda=args.tfld_lambda,
         best_hyperparams=best_hyperparams,
+        frozen_settings=frozen_k is not None,
     )
     try:
         directories = (
@@ -934,7 +938,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         prepared_runs = [
             experiment_pipeline._load_prepared_run(
                 directory,
-                recommendation_list_size=args.k,
+                recommendation_list_size=args.k or frozen_k or 150,
             )
             for directory in directories
         ]
@@ -944,6 +948,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                     f"{run.directory} belongs to dataset {run.dataset!r}, "
                     f"not one of the selected datasets {selected_datasets}"
                 )
+            if run.dataset == "amazon" and experiment_pipeline._input_partition(
+                experiment_pipeline._metadata(run.directory), "amazon",
+            ) != "brand":
+                raise ValueError(f"{run.directory} must be an Amazon brand run for RQ3")
         yelp_runs = [run for run in prepared_runs if run.dataset.lower() == "yelp"]
         yelp_files = []
         for method in selected_methods:

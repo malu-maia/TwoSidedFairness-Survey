@@ -6,6 +6,18 @@ import torch
 import torch.nn.functional as F
 
 
+def sorted_prefix(scores: torch.Tensor, k: int) -> torch.Tensor:
+    """Return the sort prefix, preserving the original tie order."""
+    if k == scores.shape[1]:
+        return scores.sort(dim=1, descending=True).indices
+    values, indices = scores.topk(k + 1, dim=1)
+    tied = (values[:, :-1] == values[:, 1:]).any(dim=1) | values.isnan().any(dim=1)
+    prefix = indices[:, :k].contiguous()
+    if tied.any():
+        prefix[tied] = scores[tied].sort(dim=1, descending=True).indices[:, :k]
+    return prefix
+
+
 def ranking_distribution(
     rankings: torch.Tensor,
     n_items: int,
@@ -18,6 +30,14 @@ def ranking_distribution(
         exposure = discounts.new_zeros((rankings.shape[0], n_items))
         return exposure.scatter_(1, rankings, discounts.expand_as(rankings))
     return F.one_hot(rankings, num_classes=n_items).permute(0, 2, 1).to(torch.float16)
+
+
+def update_exposure(
+    exposure: torch.Tensor, rankings: torch.Tensor, discounts: torch.Tensor, step: float,
+) -> torch.Tensor:
+    """Apply the Frank–Wolfe update directly to the expected exposure matrix."""
+    exposure.mul_(1 - step)
+    return exposure.scatter_add_(1, rankings, (step * discounts).expand_as(rankings))
 
 
 def policy_utilities(

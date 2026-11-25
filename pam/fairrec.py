@@ -1,4 +1,5 @@
 import torch
+import numpy as np
 
 from typing import List, Dict, Tuple
 
@@ -14,6 +15,16 @@ def greedy_round_robin(
     m, n = scores.size()
     allocation = {u: [] for u in range(m)}
     last_allocated_idx = m - 1  # Initialize to last user
+    preferences = None
+    positions = [0] * m
+    if scores.device.type == "cpu" and scores.dtype in {torch.float32, torch.float64} and torch.isfinite(scores).all():
+        # Copies only decrease within a phase, so each user can advance through
+        # their preferences without revisiting exhausted items.
+        values = scores.detach().numpy()
+        preferences = []
+        for user in range(m):
+            items = np.asarray(feasible_products[user], dtype=np.intp)
+            preferences.append(items[np.argsort(-values[user, items], kind="stable")])
     
     round_num = 0
 
@@ -23,20 +34,26 @@ def greedy_round_robin(
             u = int(user_ordering[i])
             
             # Get feasible products with available copies
-            feasible = [p for p in feasible_products[u] if available_copies[p] > 0]
-            if not feasible:
+            if preferences is None:
+                feasible = [p for p in feasible_products[u] if available_copies[p] > 0]
+                product = feasible[torch.argmax(scores[u, feasible]).item()] if feasible else None
+            else:
+                ordered = preferences[u]
+                position = positions[u]
+                while position < len(ordered) and available_copies[ordered[position]] <= 0:
+                    position += 1
+                product = int(ordered[position]) if position < len(ordered) else None
+                positions[u] = position + 1
+            if product is None:
                 if i > 0:
                     last_allocated_idx = i - 1
                 else:
                     last_allocated_idx = m - 1
                 return allocation, feasible_products, available_copies, last_allocated_idx
             
-            # Allocate best available product
-            p = feasible[torch.argmax(scores[u, feasible]).item()]
-            
-            allocation[u].append(p)
-            feasible_products[u].remove(p)
-            available_copies[p] -= 1
+            allocation[u].append(product)
+            feasible_products[u].remove(product)
+            available_copies[product] -= 1
             total_items_to_allocate -= 1
             
             if total_items_to_allocate == 0:

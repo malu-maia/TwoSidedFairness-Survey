@@ -1,6 +1,6 @@
 import torch
 
-from obm._welfare import get_b, policy_utilities, ranking_distribution
+from obm._welfare import get_b, policy_utilities, ranking_distribution, sorted_prefix, update_exposure
 
 NAME = 'Lorenz'
 
@@ -96,8 +96,7 @@ def tfld(
   print("-" * 30)
 
   # Start with a deterministic ranking where each user gets the items they have the highest score for.
-  _, sorted_indices = torch.sort(S, descending=True, dim=1)
-  top_k_indices = sorted_indices[:, :k]
+  top_k_indices = sorted_prefix(S, k)
   distribution = ranking_distribution(
       top_k_indices, M, v_exposure_weights, exposure_only=exposure_only
   )
@@ -118,18 +117,16 @@ def tfld(
       term_user = (1 - lamb) * phi_prime_u.unsqueeze(1) * S # Broadcasts to (N, M)
       term_item = lamb * phi_prime_i.unsqueeze(0)           # Broadcasts to (1, M)
  
-      A = term_user + term_item # Broadcasts to (N, M) + (N, M)
+      A = term_user.add_(term_item) # Broadcasts to (N, M) + (N, M)
 
       # Finding the next ranking direction P_tilde by sorting based on scores A
-      _, sorted_indices_tilde = torch.sort(A, descending=True, dim=1)
-      top_k_indices_tilde = sorted_indices_tilde[:, :k]
-      direction = ranking_distribution(
-          top_k_indices_tilde, M, v_exposure_weights, exposure_only=exposure_only
-      )
-
-      # Updating the stochastic ranking tensor P
-      gamma = 2 / (t + 2) # Step size
-      distribution = (1 - gamma) * distribution + gamma * direction
+      top_k_indices_tilde = sorted_prefix(A, k)
+      gamma = 2 / (t + 2)
+      if exposure_only:
+          update_exposure(distribution, top_k_indices_tilde, v_exposure_weights, gamma)
+      else:
+          direction = ranking_distribution(top_k_indices_tilde, M, v_exposure_weights, exposure_only=False)
+          distribution = (1 - gamma) * distribution + gamma * direction
 
       if (t + 1) % 100 == 0:
         total_welfare = compute_welfare(user_utilities, item_utilities, lamb=lamb, alpha_1=alpha_1, alpha_2=alpha_2, eta=eta)

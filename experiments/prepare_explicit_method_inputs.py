@@ -231,6 +231,18 @@ def _read_raw_dataset(path: Path) -> _RawDataset:
     if not path.is_file():
         raise FileNotFoundError(f"explicit dataset file not found: {path}")
 
+    if path.name == Path(DATASETS["yelp"]).name:
+        chunks = pd.read_json(path, lines=True, chunksize=100_000, convert_dates=False)
+        interactions = pd.concat([
+            chunk[["user_id", "business_id", "stars"]].astype({
+                "user_id": "string[pyarrow]", "business_id": "string[pyarrow]",
+            })
+            for chunk in chunks
+        ], ignore_index=True).rename(columns={"business_id": "item_id", "stars": "rating"})
+        if interactions.empty or not np.isfinite(interactions["rating"]).all() or (interactions["rating"] <= 0).any():
+            raise ValueError(f"{path} ratings must be non-empty, finite, and positive")
+        return _RawDataset(interactions, pd.DataFrame(columns=["user_id"]))
+
     frame: pd.DataFrame | None = None
     if path.suffix.lower() == ".json":
         frame = _read_json_lines_table(path)
@@ -840,6 +852,19 @@ def _write_run_groups(
 
     groups_dir = run_dir / "groups"
     method_dir = run_dir / "method_inputs"
+    _write_csv(
+        pd.DataFrame({"item_id": range(items), "merit": item_merit}),
+        run_dir / "item_merit.csv",
+    )
+    if dataset == "yelp" and yelp_partition == "standard":
+        provider_frame, semantics = _provider_item_mapping(
+            dataset=dataset, data_root=data_root, original_items=mappings["items"],
+        )
+        _write_csv(provider_frame, run_dir / "provider_item_mapping.csv")
+        return groups_dir, method_dir, {
+            "item_provider_semantics": semantics, "yelp_partition": "standard",
+        }
+
     metro_metadata: dict[str, object] = {}
     metro_source = data_root / "mappings" / "yelp_metro" / "yelp_business_metro.csv"
     if dataset == "yelp":
@@ -859,11 +884,6 @@ def _write_run_groups(
                 )
             metro_metadata = {"yelp_item_metro_source": None, "yelp_item_metro_mapping": None}
             print(f"Yelp metropolitan mapping not found at {metro_source}; skipping geographic groups")
-    _write_csv(
-        pd.DataFrame({"item_id": range(items), "merit": item_merit}),
-        run_dir / "item_merit.csv",
-    )
-
     if dataset == "yelp":
         cpfair_user = _write_csv(_activity_groups(train, users), groups_dir / "cpfair_user_activity.csv")
         provider_frame, provider_semantics = _provider_item_mapping(
@@ -1252,6 +1272,9 @@ def prepare_dataset_run(
     yelp_partition: str | None = None,
     movielens_director_gender: bool = False,
     amazon_brand: bool = False,
+    split_seed: int | None = None,
+    split_assignments: pd.DataFrame | None = None,
+    raw: _RawDataset | None = None,
 ) -> PreparedRun:
     """Prepare one run of one explicit dataset for method experiments."""
 
@@ -1259,8 +1282,8 @@ def prepare_dataset_run(
         raise ValueError(f"unsupported dataset {dataset!r}; choose from {sorted(DATASETS)}")
     if run < 0 or seed < 0:
         raise ValueError("seed and run must be non-negative")
-    if dataset == "yelp" and yelp_partition not in {"cpfair-territorial", "tfld-metro"}:
-        raise ValueError("Yelp requires --yelp-partition cpfair-territorial or tfld-metro")
+    if dataset == "yelp" and yelp_partition not in {"standard", "cpfair-territorial", "tfld-metro"}:
+        raise ValueError("Yelp requires --yelp-partition standard, cpfair-territorial, or tfld-metro")
     _validate_optional_positive(max_users, "max_users")
     _validate_optional_positive(max_items, "max_items")
     _validate_optional_positive(max_dense_cells, "max_dense_cells")
@@ -1272,12 +1295,12 @@ def prepare_dataset_run(
         if dataset == "amazon" and amazon_brand
         else None
     )
-    if dataset == "yelp":
+    if dataset == "yelp" and yelp_partition != "standard":
         _ensure_yelp_mapping(data_root_path, yelp_partition)
     effective_seed = seed + run
     raw_path = data_root_path / DATASETS[dataset]
     print(f"Preparing {dataset} run {run:02d} seed {effective_seed}: reading {raw_path}")
-    raw = _read_raw_dataset(raw_path)
+    raw = _read_raw_dataset(raw_path) if raw is None else raw
     attributes = _merge_user_attributes(
         raw.user_attributes,
         _read_user_sidecar(data_root_path, dataset),
@@ -1329,7 +1352,7 @@ def prepare_dataset_run(
         })
         if interactions.empty:
             raise ValueError("MovieLens director-gender partition contains no interactions")
-    if dataset == "yelp":
+    if dataset == "yelp" and yelp_partition != "standard":
         source = data_root_path / ("mappings/yelp_census/yelp_business_poverty.csv" if yelp_partition == "cpfair-territorial" else "mappings/yelp_metro/yelp_business_metro.csv")
         groups = pd.read_csv(source, dtype={"business_id": str})
         if groups.business_id.duplicated().any():
@@ -1423,6 +1446,8 @@ def prepare_dataset_run(
         learning_rate=learning_rate,
         regularization=regularization,
         generate_item_groups=dataset != "yelp" and amazon_brands is None,
+        split_seed=split_seed,
+        split_assignments=split_assignments,
     )
 
     train = pd.read_parquet(core_paths.train)
@@ -1559,8 +1584,8 @@ def prepare_explicit_method_inputs(
     if runs <= 0:
         raise ValueError("runs must be positive")
     selected = list(DATASETS if datasets is None else datasets)
-    if "yelp" in selected and yelp_partition not in {"cpfair-territorial", "tfld-metro"}:
-        raise ValueError("Yelp requires --yelp-partition cpfair-territorial or tfld-metro")
+    if "yelp" in selected and yelp_partition not in {"standard", "cpfair-territorial", "tfld-metro"}:
+        raise ValueError("Yelp requires --yelp-partition standard, cpfair-territorial, or tfld-metro")
     prepared: list[PreparedRun] = []
     for dataset in selected:
         for run in range(runs):
@@ -1601,7 +1626,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets", nargs="+", choices=sorted(DATASETS))
     parser.add_argument("--amazon-brand", action="store_true", help="Prepare a separate Amazon partition grouped by brand demand in training.")
-    parser.add_argument("--yelp-partition", choices=["cpfair-territorial", "tfld-metro"], help="Required when preparing Yelp")
+    parser.add_argument("--yelp-partition", choices=["standard", "cpfair-territorial", "tfld-metro"], help="Required when preparing Yelp")
     parser.add_argument("--movielens-director-gender", action="store_true", help="Prepare a separate MovieLens partition grouped by director gender.")
     parser.add_argument("--runs", type=int, default=DEFAULT_RUNS)
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)

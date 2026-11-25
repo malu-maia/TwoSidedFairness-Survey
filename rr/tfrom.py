@@ -1,3 +1,4 @@
+import numpy as np
 import torch
 
 NAME = 'TFROM'
@@ -27,6 +28,12 @@ def tfrom_uniform_pytorch(scores: torch.Tensor, k: int, item_to_provider: torch.
 
     # Máscara booleana para itens disponíveis
     available_items_mask = torch.ones((m_users, n_items), dtype=torch.bool, device=device)
+
+    if device.type == "cpu" and scores.dtype in {torch.float32, torch.float64} and torch.isfinite(scores).all():
+        return _allocate_cpu(
+            scores.detach().numpy(), mapped_item_to_provider.numpy(), discounts.numpy(),
+            fair_exposure.numpy(), idcg.detach().numpy(),
+        )
 
     for rank in range(k):
         if rank == 0:
@@ -93,6 +100,35 @@ def tfrom_uniform_pytorch(scores: torch.Tensor, k: int, item_to_provider: torch.
                 available_items_mask[user_idx, item_to_add] = False
                 
     return recommendations
+
+
+def _allocate_cpu(scores, providers, discounts, targets, idcg):
+    """Execute the sequential allocator without scalar tensor indexing."""
+    users, items = scores.shape
+    recommendations = np.full((users, len(discounts)), -1, dtype=np.int64)
+    available = np.ones((users, items), dtype=bool)
+    exposure = np.zeros_like(targets)
+    satisfaction = torch.zeros(users)
+    satisfaction_values = satisfaction.numpy()
+
+    for rank, discount in enumerate(discounts):
+        order = torch.randperm(users) if rank == 0 else torch.argsort(satisfaction, descending=True)
+        for user in order.tolist():
+            permitted = available[user] & ((exposure + discount <= targets)[providers])
+            if permitted.any():
+                item = np.where(permitted, scores[user], -np.inf).argmax()
+                recommendations[user, rank] = item
+                exposure[providers[item]] += discount
+                satisfaction_values[user] += scores[user, item] * discount / idcg[user]
+                available[user, item] = False
+
+    for user, rank in zip(*np.where(recommendations == -1)):
+        candidates = np.flatnonzero(available[user])
+        item = candidates[exposure[providers[candidates]].argmin()]
+        recommendations[user, rank] = item
+        exposure[providers[item]] += discounts[rank]
+        available[user, item] = False
+    return torch.from_numpy(recommendations)
 
 
 def define_random_providers(

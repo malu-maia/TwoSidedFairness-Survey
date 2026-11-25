@@ -32,16 +32,6 @@ if [[ ! $run_count =~ ^[1-9][0-9]*$ || ! $base_seed =~ ^(0|[1-9][0-9]*)$ ]]; the
   exit 2
 fi
 
-if [[ $runner == rq3 ]]; then
-  k_values=(150)
-elif [[ -n ${K:-} ]]; then
-  if [[ ! $K =~ ^[1-9][0-9]*$ ]]; then
-    printf 'K must be a positive integer.\n' >&2
-    exit 2
-  fi
-  k_values=("$K")
-fi
-
 if ! command -v "$python" >/dev/null; then
   printf 'Python executable not found: %s\n' "$python" >&2
   exit 2
@@ -52,12 +42,35 @@ if [[ $mode != prepare && -n $best_hyperparams && ! -f $best_hyperparams ]]; the
   exit 2
 fi
 
+frozen_k=
+if [[ -n $best_hyperparams && -f $best_hyperparams ]]; then
+  frozen_k=$("$python" -c 'import json,sys; data=json.load(open(sys.argv[1])); print(data["k"] if data.get("format_version")==2 else "")' "$best_hyperparams")
+fi
+chosen_k=${K:-$frozen_k}
+if [[ -n $chosen_k ]]; then
+  if [[ ! $chosen_k =~ ^[1-9][0-9]*$ ]]; then
+    printf 'K must be a positive integer.\n' >&2
+    exit 2
+  fi
+  k_values=("$chosen_k")
+elif [[ $runner == rq3 ]]; then
+  k_values=(150)
+fi
+
 if [[ $mode != run ]]; then
   common=(--output-root "$runs_root" --runs "$run_count" --seed "$base_seed"
           --recommendation-list-length "${k_values[-1]}")
   caps=(--max-users 3500 --max-items 3500)
   "$python" -m experiments.prepare_explicit_method_inputs "${common[@]}" \
     --datasets ambar --no-shared-run-zero "${caps[@]}"
+  if [[ $runner == grouped_experiments ]]; then
+    "$python" -m experiments.prepare_explicit_method_inputs "${common[@]}" \
+      --datasets movielens --no-shared-run-zero "${caps[@]}"
+    "$python" -m experiments.prepare_explicit_method_inputs "${common[@]}" \
+      --datasets amazon --allow-missing-demographics --no-shared-run-zero
+    "$python" -m experiments.prepare_explicit_method_inputs "${common[@]}" \
+      --datasets yelp --yelp-partition standard "${caps[@]}"
+  fi
   "$python" -m experiments.prepare_explicit_method_inputs "${common[@]}" \
     --datasets movielens --movielens-director-gender "${caps[@]}"
   "$python" -m experiments.prepare_explicit_method_inputs "${common[@]}" \
@@ -70,15 +83,34 @@ if [[ $mode == prepare ]]; then
   exit 0
 fi
 
+require_prepared_run() {
+  if [[ ! -f $1/metadata.json ]]; then
+    printf 'Prepared run missing: %s. Use the prepare or all mode first.\n' "$1" >&2
+    return 1
+  fi
+}
+
+movielens_partition=movielens
+amazon_partition=amazon
+yelp_partition=yelp/standard
+if [[ $runner == rq3 ]]; then
+  movielens_partition=movielens/director-gender
+  amazon_partition=amazon/brand
+  yelp_partition=yelp/cpfair-territorial
+fi
+
 run_dirs=()
-for partition in ambar movielens/director-gender amazon/brand yelp/cpfair-territorial; do
+for partition in ambar "$movielens_partition" "$amazon_partition" "$yelp_partition"; do
   for ((run = 0; run < run_count; run++)); do
     printf -v run_name 'run_%02d' "$run"
-    run_dir="$runs_root/$partition/$run_name/seed_$((base_seed + run))"
-    if [[ ! -f $run_dir/metadata.json ]]; then
-      printf 'Prepared run missing: %s. Use the prepare or all mode first.\n' "$run_dir" >&2
-      exit 1
-    fi
+    seed_dir="seed_$((base_seed + run))"
+    run_dir="$runs_root/$partition/$run_name/$seed_dir"
+    require_prepared_run "$run_dir"
+    case $partition in
+      movielens) require_prepared_run "$runs_root/movielens/director-gender/$run_name/$seed_dir" ;;
+      amazon) require_prepared_run "$runs_root/amazon/brand/$run_name/$seed_dir" ;;
+      yelp/standard) require_prepared_run "$runs_root/yelp/cpfair-territorial/$run_name/$seed_dir" ;;
+    esac
     run_dirs+=(--run-dir "$run_dir")
   done
 done

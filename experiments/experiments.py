@@ -8,7 +8,7 @@ import json
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
+from typing import Iterator, Sequence
 
 import numpy as np
 import pandas as pd
@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .metrics import ndcg
+from .metrics import _ranking_discounts, ndcg
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_RESULTS_ROOT = PROJECT_ROOT / "results"
@@ -83,15 +83,33 @@ def _split(
     validation_ratio: float,
     test_ratio: float,
     seed: int,
+    assignments: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     rng = np.random.default_rng(seed)
     parts = [[], [], []]
+    fixed = pd.Series(-1, index=frame.index)
+    if assignments is not None:
+        keys = pd.MultiIndex.from_frame(frame[["user_id", "item_id"]].astype(str))
+        labels = assignments.set_index(["user_id", "item_id"])["split"]
+        fixed[:] = labels.reindex(keys, fill_value=-1).to_numpy()
     for _, group in frame.groupby("user_id", sort=True):
-        indices = rng.permutation(group.index)
-        validation_size = max(1, round(len(indices) * validation_ratio))
-        test_size = max(1, round(len(indices) * test_ratio))
-        if validation_size + test_size >= len(indices):
+        labels = fixed.loc[group.index].to_numpy()
+        indices = rng.permutation(group.index[labels == -1])
+        validation_size = max(1, round(len(group) * validation_ratio))
+        test_size = max(1, round(len(group) * test_ratio))
+        if validation_size + test_size >= len(group):
             validation_size = test_size = 1
+        for label, part in enumerate(parts):
+            part.extend(group.index[labels == label])
+        validation_size = max(0, validation_size - np.count_nonzero(labels == 1))
+        test_size = max(0, test_size - np.count_nonzero(labels == 2))
+        if assignments is not None:
+            reserve = int(not np.any(labels == 0))
+            if len(indices) - reserve < int(validation_size > 0) + int(test_size > 0):
+                validation_size = test_size = 0
+            else:
+                validation_size = min(validation_size, len(indices) - reserve - int(test_size > 0))
+                test_size = min(test_size, len(indices) - reserve - validation_size)
         parts[1].extend(indices[:validation_size])
         parts[2].extend(indices[validation_size : validation_size + test_size])
         parts[0].extend(indices[validation_size + test_size :])
@@ -102,7 +120,7 @@ def _split(
         train_items = set(train["item_id"])
         validation = validation[validation["item_id"].isin(train_items)]
         test = test[test["item_id"].isin(train_items)]
-        users = set(validation["user_id"]) & set(test["user_id"])
+        users = set(train["user_id"]) & set(validation["user_id"]) & set(test["user_id"])
         train = train[train["user_id"].isin(users)]
         validation = validation[validation["user_id"].isin(users)]
         test = test[test["user_id"].isin(users)]
@@ -176,34 +194,24 @@ def _per_user_min_max(matrix: torch.Tensor) -> torch.Tensor:
     return torch.where(span > 0, normalized, torch.full_like(matrix, 0.5))
 
 
-def _fit_mf(
+def _mf_epochs(
     train: pd.DataFrame,
-    validation: pd.DataFrame,
-    users: int,
-    items: int,
+    train_matrix: torch.Tensor,
     *,
     factors: int,
     epochs: int,
-    patience: int,
     batch_size: int,
     learning_rate: float,
     regularization: float,
     seed: int,
-) -> tuple[np.ndarray, int, float]:
+) -> Iterator[tuple[int, _BiasedMF]]:
     torch.manual_seed(seed)
-    model = _BiasedMF(users, items, factors)
+    model = _BiasedMF(*train_matrix.shape, factors)
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     user_ids = torch.tensor(train["user_id"].to_numpy(), dtype=torch.long)
     item_ids = torch.tensor(train["item_id"].to_numpy(), dtype=torch.long)
     ratings = torch.tensor(train["rating"].to_numpy(), dtype=torch.float32)
-    train_matrix = torch.zeros((users, items), dtype=torch.float32)
-    train_matrix[user_ids, item_ids] = ratings
-    validation_matrix = torch.tensor(
-        _matrix(validation, users, items), dtype=torch.float32
-    )
-    evaluation_k = min(10, items)
     generator = torch.Generator().manual_seed(seed)
-    best_state, best_ndcg, stale, best_epoch = copy.deepcopy(model.state_dict()), -math.inf, 0, 0
 
     for epoch in range(1, epochs + 1):
         for batch in torch.randperm(len(train), generator=generator).split(batch_size):
@@ -227,6 +235,31 @@ def _fit_mf(
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+        yield epoch, model
+
+
+def _fit_mf(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    users: int,
+    items: int,
+    *,
+    factors: int,
+    epochs: int,
+    patience: int,
+    batch_size: int,
+    learning_rate: float,
+    regularization: float,
+    seed: int,
+) -> tuple[np.ndarray, int, float]:
+    train_matrix = torch.from_numpy(_matrix(train, users, items))
+    validation_matrix = torch.from_numpy(_matrix(validation, users, items))
+    evaluation_k = min(10, items)
+    best_state, best_ndcg, stale, best_epoch = None, -math.inf, 0, 0
+    for epoch, model in _mf_epochs(
+        train, train_matrix, factors=factors, epochs=epochs, batch_size=batch_size,
+        learning_rate=learning_rate, regularization=regularization, seed=seed,
+    ):
         validation_ndcg = _validation_ndcg(model, train_matrix, validation_matrix, evaluation_k)
         if validation_ndcg > best_ndcg + 1e-6:
             best_state, best_ndcg, stale, best_epoch = (
@@ -244,6 +277,61 @@ def _fit_mf(
     with torch.no_grad():
         predictions = _per_user_min_max(model.matrix_for_ranking()).numpy()
     return predictions, best_epoch, best_ndcg
+
+
+def _fit_mf_by_cutoff(
+    train: pd.DataFrame,
+    validation: pd.DataFrame,
+    users: int,
+    items: int,
+    *,
+    cutoffs: tuple[int, ...],
+    factors: int,
+    epochs: int,
+    batch_size: int,
+    learning_rate: float,
+    regularization: float,
+    seed: int,
+) -> Iterator[tuple[int, np.ndarray, int, float]]:
+    """Keep the best validation checkpoint at every cutoff on one trajectory."""
+    if not cutoffs or tuple(sorted(set(cutoffs))) != cutoffs or not 1 <= cutoffs[0] <= cutoffs[-1] <= items:
+        raise ValueError("cutoffs must be unique, increasing, and between one and the number of items")
+    train_matrix = torch.from_numpy(_matrix(train, users, items))
+    available = train_matrix == 0
+    cohort = available.sum(dim=1) >= cutoffs[-1]
+    if not cohort.any():
+        raise ValueError("no users are eligible for every checkpoint cutoff")
+    relevant = torch.from_numpy(_matrix(validation, users, items))[cohort]
+    eligible = available[cohort]
+    if not torch.isfinite(relevant).all() or (relevant < 0).any() or (relevant.gt(0) & ~eligible).any():
+        raise ValueError("invalid validation relevance for the checkpoint cohort")
+    discounts = _ranking_discounts(cutoffs[-1], dtype=relevant.dtype)
+    ideal = relevant.topk(cutoffs[-1], dim=1).values * discounts
+    ideal_at_k = {k: ideal[:, :k].sum(dim=1) for k in cutoffs}
+    best = {}
+    for epoch, model in _mf_epochs(
+        train, train_matrix, factors=factors, epochs=epochs, batch_size=batch_size,
+        learning_rate=learning_rate, regularization=regularization, seed=seed,
+    ):
+        with torch.no_grad():
+            scores = _per_user_min_max(model.matrix_for_ranking()[cohort])
+            scores.masked_fill_(~eligible, -torch.inf)
+            values = {}
+            for k in cutoffs:
+                ranking = scores.topk(k, dim=1).indices
+                actual = (relevant.gather(1, ranking) * discounts[:k]).sum(dim=1)
+                denominator = ideal_at_k[k]
+                values[k] = float(torch.where(denominator > 0, actual / denominator, 0.0).mean())
+            improved = [k for k in cutoffs if k not in best or values[k] > best[k][1]]
+            if improved:
+                state = copy.deepcopy(model.state_dict())
+                for k in improved:
+                    best[k] = (epoch, values[k], state)
+    for k, (epoch, value, state) in sorted(best.items()):
+        model.load_state_dict(state)
+        with torch.no_grad():
+            predictions = _per_user_min_max(model.matrix_for_ranking()).numpy()
+        yield k, predictions, epoch, value
 
 
 def _json_value(value: object) -> object:
@@ -319,6 +407,8 @@ def prepare_experiment(
     item_group_mapping: str | Path | None = None,
     popularity_top_fraction: float = 0.2,
     generate_item_groups: bool = True,
+    split_seed: int | None = None,
+    split_assignments: pd.DataFrame | None = None,
 ) -> ExperimentPaths:
     """Prepare aligned held-out data, MF predictions, groups, and providers."""
 
@@ -349,13 +439,14 @@ def prepare_experiment(
         raise ValueError("data contains no users with at least three distinct interactions")
 
     train_original, validation_original, test_original = _split(
-        aggregated, validation_ratio, test_ratio, effective_seed
+        aggregated, validation_ratio, test_ratio,
+        effective_seed if split_seed is None else split_seed, split_assignments,
     )
     user_ids = sorted(set(train_original["user_id"]), key=lambda value: (type(value).__name__, str(value)))
     item_ids = sorted(set(train_original["item_id"]), key=lambda value: (type(value).__name__, str(value)))
     users = {value: index for index, value in enumerate(user_ids)}
     items = {value: index for index, value in enumerate(item_ids)}
-    rating_scale = float(aggregated["rating"].max())
+    rating_scale = float((aggregated if split_seed is None else train_original)["rating"].max())
     train = _mapped(train_original, users, items, rating_scale)
     validation = _mapped(validation_original, users, items, rating_scale)
     test = _mapped(test_original, users, items, rating_scale)

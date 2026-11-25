@@ -79,6 +79,7 @@ class RunnerConfig:
     device: str = "cpu"
     yelp_tfld_partition: str = "tfld-metro"
     best_hyperparams: Mapping[str, Mapping[str, dict]] | None = None
+    frozen_settings: bool = False
 
     def hyperparams_for(self, dataset: str, method: str) -> dict:
         if self.best_hyperparams is None:
@@ -168,9 +169,31 @@ def _resolve(path: str | Path) -> Path:
 
 def load_best_group_hyperparams(path: str | Path, *, cpfair_suite: str) -> dict[str, dict[str, dict]]:
     """Read the selected CPFair and TFLD-Groups parameters for each dataset."""
+    return load_hyperparameter_config(path, cpfair_suite=cpfair_suite)[0]
+
+
+def load_hyperparameter_config(
+    path: str | Path, *, cpfair_suite: str,
+) -> tuple[dict[str, dict[str, dict]], int | None]:
+    """Read a frozen configuration, or the legacy group-only settings."""
     source = _resolve(path)
     data = json.loads(source.read_text(encoding="utf-8"))
     try:
+        if data.get("format_version") == 2:
+            k = data["k"]
+            if type(k) is not int or k < 1:
+                raise ValueError(f"{source} has an invalid shared cutoff")
+            expected = {method for group in GROUPS for method in group.methods} | {"TFLD-Groups"}
+            selected = {}
+            for dataset, methods in data["datasets"].items():
+                if set(methods) != expected:
+                    raise ValueError(f"{source} has incomplete frozen methods for {dataset}")
+                selected[dataset] = {method: entry["parameters"] for method, entry in methods.items()}
+                if any(not isinstance(parameters, dict) or not parameters for parameters in selected[dataset].values()):
+                    raise ValueError(f"{source} has invalid frozen parameters for {dataset}")
+            if not selected:
+                raise ValueError(f"{source} has no frozen datasets")
+            return selected, k
         selections = {
             dataset: {
                 method: data["parameters"][method][suites[suite][method]]
@@ -184,7 +207,7 @@ def load_best_group_hyperparams(path: str | Path, *, cpfair_suite: str) -> dict[
         for method, parameters in methods.items():
             if not isinstance(parameters, dict) or not parameters:
                 raise ValueError(f"{source} has invalid parameters for {method} on {dataset}")
-    return selections
+    return selections, None
 
 
 def _read_table(path: Path) -> pd.DataFrame:
@@ -1127,6 +1150,8 @@ def _eligible_scores(run: PreparedRun) -> torch.Tensor:
 
 
 def _run_cpfair(run: PreparedRun, config: RunnerConfig) -> MethodOutput:
+    if config.frozen_settings:
+        return _run_frozen_setting(run, config, "CPFair")
     from pam.greedy_cpfair import cpfair
 
     _yelp_partition(run, "cpfair-territorial")
@@ -1202,7 +1227,7 @@ def _tfld_group_vectors(
     run: PreparedRun, config: RunnerConfig
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if run.dataset.lower() == "yelp":
-        partition = config.yelp_tfld_partition
+        partition = "cpfair-territorial" if config.frozen_settings else config.yelp_tfld_partition
         _yelp_partition(run, partition)
         user_groups = _activity_cpfair_groups(run)
         item_group_values = _mapping_vector(
@@ -1225,6 +1250,8 @@ def _tfld_group_vectors(
 
 
 def _run_tfld_groups(run: PreparedRun, config: RunnerConfig) -> MethodOutput:
+    if config.frozen_settings:
+        return _run_frozen_setting(run, config, "TFLD-Groups")
     from obm.tfld_groups import tfld_groups
 
     user_groups, item_groups = _tfld_group_vectors(run, config)
@@ -1319,6 +1346,25 @@ _METHOD_ADAPTERS: dict[str, MethodAdapter] = {
 _GROUP_ADAPTERS: dict[tuple[str, int], MethodAdapter] = {
     ("GGF", 4): _run_ggf_user_quantile,
 }
+
+
+def _run_frozen_setting(run: PreparedRun, config: RunnerConfig, method: str) -> MethodOutput:
+    from .sensitivity_methods import rank_setting
+
+    if method in {"CPFair", "TFLD-Groups"} and run.dataset == "yelp":
+        _yelp_partition(run, "cpfair-territorial")
+    return rank_setting(run, method, config.hyperparams_for(run.dataset, method), device=config.device).output
+
+
+def _group_partition(dataset: str, method: str, config: RunnerConfig) -> str | None:
+    if dataset == "yelp":
+        return "cpfair-territorial" if method == "CPFair" or config.frozen_settings else config.yelp_tfld_partition
+    return {"amazon": "brand", "movielens": "director-gender"}.get(dataset)
+
+
+def _input_partition(metadata: Mapping[str, object], dataset: str) -> str:
+    value = metadata.get(f"{dataset}_partition")
+    return str(value) if value else "standard"
 
 
 def _fairness_metric(
@@ -1445,7 +1491,7 @@ def discover_run_directories(runs_root: str | Path) -> list[Path]:
     """Return prepared ``seed_*`` run directories under ``runs_root``."""
 
     root = _resolve(runs_root)
-    candidates = sorted(root.glob("*/run_*/seed_*"))
+    candidates = sorted([*root.glob("*/run_*/seed_*"), *root.glob("yelp/standard/run_*/seed_*")])
     return [path for path in candidates if path.is_dir()]
 
 
@@ -1479,41 +1525,46 @@ def run_grouped_experiments(
 
     results_base = _resolve(results_root)
     written: list[Path] = []
+    visited = set()
     for run_dir in directories:
         prepared = _load_prepared_run(run_dir, recommendation_list_size)
-        movielens_partition = (
-            prepared.dataset.lower() == "movielens"
-            and _metadata(prepared.directory).get("movielens_partition") == "director-gender"
-        )
-        director_run: PreparedRun | None = prepared if movielens_partition else None
+        dataset = prepared.dataset.lower()
+        partition = _input_partition(_metadata(prepared.directory), dataset)
+        variants = {partition: prepared}
         method_cache: dict[tuple[str, int], MethodOutput] = {}
         for group in groups:
             rows: list[dict[str, object]] = []
             for method in group.methods:
-                if movielens_partition and method not in {"CPFair", "TFLD-Groups"}:
+                group_method = method in {"CPFair", "TFLD-Groups"}
+                target = (_group_partition(dataset, method, resolved_config) if group_method else None) or "standard"
+                if partition != "standard" and partition != target:
                     continue
-                method_run = prepared
-                if prepared.dataset.lower() == "movielens" and method in {"CPFair", "TFLD-Groups"}:
-                    if director_run is None:
-                        director_dir = run_dir.parent.parent / "director-gender" / run_dir.parent.name / run_dir.name
-                        if not director_dir.is_dir():
-                            raise FileNotFoundError(f"MovieLens director-gender run not found: {director_dir}; prepare with --movielens-director-gender")
-                        director_run = _load_prepared_run(director_dir, recommendation_list_size)
-                    method_run = director_run
-                # Group-specific adapters get their own cache entry; every other
-                # method is computed once per run and shared across groups.
-                group_adapter = _GROUP_ADAPTERS.get((method, group.number))
+                if target not in variants:
+                    dataset_dir = run_dir.parent.parent
+                    if dataset_dir.name != dataset:
+                        dataset_dir = dataset_dir.parent
+                    target_dir = dataset_dir / target / run_dir.parent.name / run_dir.name
+                    if not target_dir.is_dir():
+                        raise FileNotFoundError(f"Matching {dataset} {target} run not found: {target_dir}")
+                    variants[target] = _load_prepared_run(target_dir, recommendation_list_size)
+                method_run = variants[target]
+                result_key = (method_run.directory, group.number, method)
+                if result_key in visited:
+                    continue
+                visited.add(result_key)
+                group_adapter = None if resolved_config.frozen_settings else _GROUP_ADAPTERS.get((method, group.number))
                 cache_key = (method, group.number if group_adapter else -1)
                 if cache_key not in method_cache:
-                    if group_adapter is None:
-                        try:
-                            group_adapter = _METHOD_ADAPTERS[method]
-                        except KeyError as error:
-                            raise ValueError(
-                                f"unsupported method: {method}"
-                            ) from error
-                    _seed_everything(method_run.seed)
-                    method_cache[cache_key] = group_adapter(method_run, resolved_config)
+                    if resolved_config.frozen_settings:
+                        method_cache[cache_key] = _run_frozen_setting(method_run, resolved_config, method)
+                    else:
+                        if group_adapter is None:
+                            try:
+                                group_adapter = _METHOD_ADAPTERS[method]
+                            except KeyError as error:
+                                raise ValueError(f"unsupported method: {method}") from error
+                        _seed_everything(method_run.seed)
+                        method_cache[cache_key] = group_adapter(method_run, resolved_config)
                 rows.append(
                     _result_row(
                         method_run,
@@ -1575,7 +1626,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--tfld-epochs", type=_positive_int, default=200)
     parser.add_argument(
         "--best-hyperparams", type=Path,
-        help="JSON file with dataset-specific RQ4 CPFair and RQ3 TFLD-Groups settings.",
+        help="JSON file with frozen dataset-specific settings and the shared cutoff.",
     )
     parser.add_argument(
         "--include-tfld-groups", action="store_true",
@@ -1591,9 +1642,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args(argv)
     best_hyperparams = None
+    frozen_k = None
     if args.best_hyperparams is not None:
         try:
-            best_hyperparams = load_best_group_hyperparams(args.best_hyperparams, cpfair_suite="RQ4")
+            best_hyperparams, frozen_k = load_hyperparameter_config(args.best_hyperparams, cpfair_suite="RQ4")
         except (OSError, ValueError) as error:
             parser.error(str(error))
 
@@ -1621,7 +1673,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise ValueError("--multifr-positive-threshold must be non-negative")
 
     groups = GROUPS
-    if args.include_tfld_groups:
+    if args.include_tfld_groups or frozen_k is not None:
         groups = tuple(
             replace(group, methods=(*group.methods, "TFLD-Groups"))
             if group.number in {2, 8} and "CPFair" in group.methods and "TFLD-Groups" not in group.methods
@@ -1634,7 +1686,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         results_root=args.results_root,
         run_dirs=args.run_dir,
         datasets=args.dataset,
-        recommendation_list_size=args.recommendation_list_size,
+        recommendation_list_size=args.recommendation_list_size or frozen_k,
         groups=groups,
         config=RunnerConfig(
             ada2fair_epochs=args.ada2fair_epochs,
@@ -1654,6 +1706,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             multifr_positive_threshold=args.multifr_positive_threshold,
             device=args.device,
             best_hyperparams=best_hyperparams,
+            frozen_settings=frozen_k is not None,
         ),
     )
     for path in paths:

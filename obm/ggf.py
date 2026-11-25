@@ -5,7 +5,7 @@ import torch
 
 from scipy.optimize import isotonic_regression
 
-from obm._welfare import get_b, policy_utilities, ranking_distribution
+from obm._welfare import get_b, policy_utilities, ranking_distribution, sorted_prefix, update_exposure
 
 NAME='Gini'
 
@@ -153,8 +153,7 @@ def ggf(
     if beta is not None and beta <= 0:
         raise ValueError(f"beta must be positive, got {beta}")
 
-    _, sorted_indices = torch.sort(scores, descending=True, dim=1)
-    top_k_indices = sorted_indices[:, :resolved_k]
+    top_k_indices = sorted_prefix(scores, resolved_k)
     b = get_b(resolved_k).to(device)
     distribution = ranking_distribution(
         top_k_indices, m, b, exposure_only=exposure_only
@@ -175,14 +174,16 @@ def ggf(
         y2 = projection(v/beta_t, w2, device).to(device)
 
         #scores_tilde = (1 - lamb) * torch.einsum('i,ij->ij', y1, scores) + lamb * y2
-        scores_tilde = (1 - lamb) * y1.view(-1, 1) * scores + lamb * y2.view(1, -1)
+        scores_tilde = ((1 - lamb) * y1.view(-1, 1) * scores).add_(lamb * y2.view(1, -1))
 
-        _, sorted_indices = torch.sort(scores_tilde, descending=True, dim=1)
-        top_k_indices = sorted_indices[:, :resolved_k]
+        top_k_indices = sorted_prefix(scores_tilde, resolved_k)
     
-        direction = ranking_distribution(top_k_indices, m, b, exposure_only=exposure_only)
         gamma = 2 / (t + 2)
-        distribution = (1 - gamma) * distribution + gamma * direction
+        if exposure_only:
+            update_exposure(distribution, top_k_indices, b, gamma)
+        else:
+            direction = ranking_distribution(top_k_indices, m, b, exposure_only=False)
+            distribution = (1 - gamma) * distribution + gamma * direction
 
         loss = loss_function(u, v, w1, w2, lamb)
         losses.append(-loss)

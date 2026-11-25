@@ -54,6 +54,8 @@ def _validate_bounds(
 
 def _ranked_items(scores: torch.Tensor) -> list[list[int]]:
     cpu_scores = scores.detach().cpu()
+    if torch.isfinite(cpu_scores).all():
+        return torch.argsort(cpu_scores, dim=1, descending=True, stable=True).tolist()
     return [
         sorted(
             range(cpu_scores.shape[1]),
@@ -86,6 +88,7 @@ def _repair_underexposed_products(
         return
 
     cpu_scores = scores.detach().cpu()
+    values = cpu_scores.numpy() if cpu_scores.dtype in {torch.float32, torch.float64} else cpu_scores
     n_items = cpu_scores.shape[1]
 
     for target_item in range(n_items):
@@ -95,11 +98,11 @@ def _repair_underexposed_products(
                 if target_item in allocation_sets[user]:
                     continue
 
-                target_score = float(cpu_scores[user, target_item])
+                target_score = float(values[user, target_item])
                 for position, old_item in enumerate(user_allocation):
                     if exposure[old_item] <= product_min:
                         continue
-                    utility_loss = float(cpu_scores[user, old_item]) - target_score
+                    utility_loss = float(values[user, old_item]) - target_score
                     candidate = (utility_loss, user, position, old_item)
                     if best_candidate is None or candidate < best_candidate:
                         best_candidate = candidate
@@ -157,6 +160,7 @@ def seal(
 
     n_users, n_items = scores.shape
     cpu_scores = scores.detach().cpu()
+    values = cpu_scores.numpy() if cpu_scores.dtype in {torch.float32, torch.float64} else cpu_scores
     rankings = _ranked_items(scores)
     allocations: list[list[int]] = [[] for _ in range(n_users)]
     allocation_sets: list[set[int]] = [set() for _ in range(n_users)]
@@ -191,7 +195,7 @@ def seal(
             allocations[user].append(item)
             allocation_sets[user].add(item)
             exposure[item] += 1
-            user_utilities[user] += float(cpu_scores[user, item])
+            user_utilities[user] += float(values[user, item])
 
     _repair_underexposed_products(
         scores,
